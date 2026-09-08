@@ -1,0 +1,28 @@
+[package]
+name = "bigyo"
+version = "0.1.0"
+edition = "2024"
+description = "Syntax-aware 3-way TUI merge tool built on difftastic and mergiraf"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syntect = "5.3"
+tempfile = "3"
+two-face = "0.5"
+unicode-width = "0.2"
+
+[lib]
+name = "bigyo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bigyo"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
