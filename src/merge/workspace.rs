@@ -68,6 +68,11 @@ pub struct FileEntry {
     /// single-file mode and from one path's index stages in directory mode.
     pub names: SectionNames,
     pub kind: EntryKind,
+    /// From the `linguist-language` gitattribute, read once when the workspace
+    /// is built — never on reload, which happens on every resolution keypress.
+    pub attr_language: Option<String>,
+    /// Chosen in-session, overriding the attribute for this file alone.
+    pub language: Option<String>,
     /// Built on first open. Running mergiraf for every file up front would
     /// stall the launch on a large merge.
     pub session: Option<MergeSession>,
@@ -99,6 +104,21 @@ impl FileEntry {
         }
     }
 
+    /// The language for syntect and difftastic: an in-session choice if there
+    /// is one, else whatever the gitattribute said.
+    pub fn effective_language(&self) -> Option<&str> {
+        self.language.as_deref().or(self.attr_language.as_deref())
+    }
+
+    /// The language for mergiraf — *only* an explicit in-session choice.
+    ///
+    /// Mergiraf reads `mergiraf.language` and `linguist-language` itself, with
+    /// the former taking precedence, so handing the attribute back would
+    /// clobber a deliberate `mergiraf.language` setting.
+    pub fn override_language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+
     pub fn is_diff(&self) -> bool {
         self.kind == EntryKind::Diff
     }
@@ -119,10 +139,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(files: Vec<FileEntry>) -> Self {
         // Start on the first file that can actually be opened.
-        let current = files
-            .iter()
-            .position(FileEntry::is_openable)
-            .unwrap_or(0);
+        let current = files.iter().position(FileEntry::is_openable).unwrap_or(0);
         Self { files, current }
     }
 
@@ -165,13 +182,30 @@ impl Workspace {
                 left,
                 right,
                 kind: EntryKind::Merge,
+                attr_language: None,
+                language: None,
                 session: None,
                 binary,
                 saved: false,
             });
         }
 
-        Ok(Self::new(files))
+        let mut workspace = Self::new(files);
+        workspace.read_attributes(repo);
+        Ok(workspace)
+    }
+
+    /// Ask git for each entry's `linguist-language`, in one call.
+    fn read_attributes(&mut self, repo: &Repo) {
+        let paths: Vec<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
+        // No repo, no attributes, no problem: detection falls back to the
+        // extension, so a failure here is not worth reporting.
+        let Ok(languages) = repo.linguist_languages(&paths) else {
+            return;
+        };
+        for file in &mut self.files {
+            file.attr_language = languages.get(&file.path).cloned();
+        }
     }
 
     /// Pair the files of two directory trees by relative path.
@@ -191,10 +225,25 @@ impl Workspace {
                 // A path present on only one side reads as added or deleted.
                 let (old, old_binary) = read_side(&old_root.join(&rel));
                 let (new, new_binary) = read_side(&new_root.join(&rel));
-                diff_entry(rel.clone(), new_root.join(&rel), old, new, old_binary || new_binary)
+                diff_entry(
+                    rel.clone(),
+                    new_root.join(&rel),
+                    old,
+                    new,
+                    old_binary || new_binary,
+                )
             })
             .collect();
-        Ok(Self::new(files))
+        let mut workspace = Self::new(files);
+        // The temp trees are not a repository, but the relative paths inside
+        // them are the repo's, so the cwd's repo is the one to ask.
+        if let Ok(Some(repo)) = std::env::current_dir()
+            .map_err(anyhow::Error::from)
+            .and_then(|cwd| Repo::discover(&cwd))
+        {
+            workspace.read_attributes(&repo);
+        }
+        Ok(workspace)
     }
 
     /// One pair of files, as `difftool.<tool>.cmd` passes $LOCAL and $REMOTE.
@@ -204,13 +253,22 @@ impl Workspace {
     pub fn from_pair(old: &Path, new: &Path, display: &Path) -> Result<Self> {
         let (old_text, old_binary) = read_side(old);
         let (new_text, new_binary) = read_side(new);
-        Ok(Self::new(vec![diff_entry(
+        let mut workspace = Self::new(vec![diff_entry(
             display.to_path_buf(),
             new.to_path_buf(),
             old_text,
             new_text,
             old_binary || new_binary,
-        )]))
+        )]);
+        // $LOCAL and $REMOTE are temp files whose names mean nothing; $MERGED
+        // is the real path, and that is what has attributes.
+        if let Ok(Some(repo)) = std::env::current_dir()
+            .map_err(anyhow::Error::from)
+            .and_then(|cwd| Repo::discover(&cwd))
+        {
+            workspace.read_attributes(&repo);
+        }
+        Ok(workspace)
     }
 
     /// Everything `git diff <rev>` reports, against the working tree.
@@ -236,15 +294,11 @@ impl Workspace {
             };
             let abs = repo.root().join(&entry.path);
             let (new, new_binary) = read_side(&abs);
-            files.push(diff_entry(
-                entry.path,
-                abs,
-                old,
-                new,
-                binary || new_binary,
-            ));
+            files.push(diff_entry(entry.path, abs, old, new, binary || new_binary));
         }
-        Ok(Self::new(files))
+        let mut workspace = Self::new(files);
+        workspace.read_attributes(repo);
+        Ok(workspace)
     }
 
     pub fn files(&self) -> &[FileEntry] {
@@ -341,6 +395,8 @@ fn diff_entry(path: PathBuf, abs: PathBuf, old: String, new: String, binary: boo
         left: old,
         right: new,
         kind: EntryKind::Diff,
+        attr_language: None,
+        language: None,
         session: None,
         binary,
         saved: false,
@@ -410,6 +466,8 @@ mod tests {
             right: "r\n".into(),
             names: SectionNames::default(),
             kind: EntryKind::Merge,
+            attr_language: None,
+            language: None,
             session: None,
             binary: false,
             saved: false,
@@ -566,7 +624,10 @@ mod tests {
 
     #[test]
     fn a_diff_entry_reports_what_happened_to_the_file() {
-        assert_eq!(diff_file("a.rs", "old\n", "new\n").state(), FileState::Modified);
+        assert_eq!(
+            diff_file("a.rs", "old\n", "new\n").state(),
+            FileState::Modified
+        );
         assert_eq!(diff_file("a.rs", "", "new\n").state(), FileState::Added);
         assert_eq!(diff_file("a.rs", "old\n", "").state(), FileState::Deleted);
     }
@@ -600,7 +661,9 @@ mod tests {
             .collect();
         assert_eq!(
             words,
-            ["conflict", "resolved", "binary", "added", "modified", "deleted"]
+            [
+                "conflict", "resolved", "binary", "added", "modified", "deleted"
+            ]
         );
         // one word each, so a list row stays one column wide
         assert!(words.iter().all(|w| !w.contains(' ')));
@@ -667,6 +730,59 @@ mod tests {
         assert_eq!(w.files()[0].left, "a\n");
         assert_eq!(w.files()[0].right, "b\n");
         assert_eq!(w.files()[0].state(), FileState::Modified);
+    }
+
+    // ---- language resolution ----------------------------------------------
+
+    #[test]
+    fn an_entry_with_nothing_set_names_no_language() {
+        let f = file("a.rs");
+        assert_eq!(f.effective_language(), None);
+        assert_eq!(f.override_language(), None);
+    }
+
+    #[test]
+    fn the_attribute_supplies_a_language_to_syntect_but_not_to_mergiraf() {
+        // mergiraf reads `linguist-language` itself, with `mergiraf.language`
+        // taking precedence, so handing it back would clobber that.
+        let mut f = file("a.weird");
+        f.attr_language = Some("Rust".into());
+        assert_eq!(f.effective_language(), Some("Rust"));
+        assert_eq!(f.override_language(), None);
+    }
+
+    #[test]
+    fn an_in_session_choice_outranks_the_attribute_and_reaches_mergiraf() {
+        let mut f = file("a.weird");
+        f.attr_language = Some("Rust".into());
+        f.language = Some("Python".into());
+        assert_eq!(f.effective_language(), Some("Python"));
+        assert_eq!(f.override_language(), Some("Python"));
+    }
+
+    #[test]
+    fn clearing_the_choice_falls_back_to_the_attribute() {
+        let mut f = file("a.weird");
+        f.attr_language = Some("Rust".into());
+        f.language = Some("Python".into());
+        f.language = None;
+        assert_eq!(f.effective_language(), Some("Rust"));
+    }
+
+    #[test]
+    fn language_choices_are_per_file_and_survive_switching() {
+        let mut w = Workspace::new(vec![file("a.rs"), file("b.rs")]);
+        w.current_mut().unwrap().language = Some("Python".into());
+
+        assert!(w.advance(true));
+        assert_eq!(
+            w.current().unwrap().effective_language(),
+            None,
+            "the next file must not inherit it"
+        );
+
+        assert!(w.advance(false));
+        assert_eq!(w.current().unwrap().effective_language(), Some("Python"));
     }
 
     #[test]

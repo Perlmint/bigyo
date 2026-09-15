@@ -2,8 +2,10 @@
 //!
 //! Driven as a subprocess like `difft` and `mergiraf`, rather than linked.
 
+use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -128,6 +130,52 @@ impl Repo {
         Ok(out.status.success().then_some(out.stdout))
     }
 
+    /// The `linguist-language` gitattribute of each path that sets one.
+    ///
+    /// Batched through `--stdin`: a whole workspace costs one subprocess rather
+    /// than one per file, which matters because the result is read once at
+    /// construction and then never again.
+    pub fn linguist_languages(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, String>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend_from_slice(path.as_os_str().as_encoded_bytes());
+            input.push(0);
+        }
+
+        let mut child = Command::new("git")
+            .current_dir(&self.root)
+            .args(["check-attr", "--stdin", "-z", LINGUIST_LANGUAGE])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("running `git check-attr`")?;
+        child
+            .stdin
+            .take()
+            .context("git check-attr took no stdin")?
+            .write_all(&input)
+            .context("writing paths to git check-attr")?;
+        let out = child
+            .wait_with_output()
+            .context("running `git check-attr`")?;
+        if !out.status.success() {
+            // Outside a repository, or any other failure: no attributes, which
+            // is not an error — detection simply falls back to the extension.
+            return Ok(HashMap::new());
+        }
+
+        Ok(parse_check_attr(&out.stdout)?
+            .into_iter()
+            .filter(|(_, attr, _)| attr == LINGUIST_LANGUAGE)
+            .filter_map(|(path, _, value)| attribute_value(&value).map(|v| (path, v.to_owned())))
+            .collect())
+    }
+
     /// Stage `path`, which is what marks a conflict resolved for git.
     pub fn add(&self, path: &Path) -> Result<()> {
         let out = Command::new("git")
@@ -145,6 +193,41 @@ impl Repo {
             );
         }
         Ok(())
+    }
+}
+
+pub const LINGUIST_LANGUAGE: &str = "linguist-language";
+
+/// Parse `git check-attr -z` output: `<path>\0<attribute>\0<value>\0` records.
+pub fn parse_check_attr(bytes: &[u8]) -> Result<Vec<(PathBuf, String, String)>> {
+    let mut fields = bytes.split(|&b| b == 0);
+    let mut out = Vec::new();
+
+    loop {
+        // Trailing NUL leaves an empty final field; that is the end, not a record.
+        let Some(path) = fields.next().filter(|f| !f.is_empty()) else {
+            return Ok(out);
+        };
+        let (Some(attr), Some(value)) = (fields.next(), fields.next()) else {
+            bail!("truncated check-attr record");
+        };
+        let text = |f: &[u8]| -> Result<String> {
+            Ok(std::str::from_utf8(f)
+                .context("git check-attr produced a field that is not valid UTF-8")?
+                .to_owned())
+        };
+        out.push((PathBuf::from(text(path)?), text(attr)?, text(value)?));
+    }
+}
+
+/// The value of a gitattribute, or `None` when it carries no useful one.
+///
+/// `unspecified` means the attribute is not set at all; `set` and `unset` are
+/// the boolean forms, which say nothing about which language a file is.
+pub fn attribute_value(value: &str) -> Option<&str> {
+    match value {
+        "" | "unspecified" | "unset" | "set" => None,
+        other => Some(other),
     }
 }
 
@@ -168,9 +251,7 @@ pub fn parse_name_status(bytes: &[u8]) -> Result<Vec<ChangedEntry>> {
     let mut fields = bytes
         .split(|&b| b == 0)
         .filter(|f| !f.is_empty())
-        .map(|f| {
-            std::str::from_utf8(f).context("git reported a field that is not valid UTF-8")
-        });
+        .map(|f| std::str::from_utf8(f).context("git reported a field that is not valid UTF-8"));
 
     let mut out = Vec::new();
     while let Some(status) = fields.next().transpose()? {
@@ -401,6 +482,91 @@ mod tests {
                 assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "{sha:?}");
             }
         }
+    }
+
+    // ---- git check-attr -z -----------------------------------------------
+
+    /// Build `check-attr -z` output from `(path, value)` pairs.
+    fn check_attr(records: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (path, value) in records {
+            for field in [*path, LINGUIST_LANGUAGE, *value] {
+                out.extend_from_slice(field.as_bytes());
+                out.push(0);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_set_attribute_carries_its_language() {
+        let parsed = parse_check_attr(&check_attr(&[("a.weird", "Rust")])).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, PathBuf::from("a.weird"));
+        assert_eq!(parsed[0].1, LINGUIST_LANGUAGE);
+        assert_eq!(attribute_value(&parsed[0].2), Some("Rust"));
+    }
+
+    #[test]
+    fn the_boolean_and_absent_forms_name_no_language() {
+        // `unspecified` is "not set"; `set`/`unset` are the boolean forms, which
+        // say nothing about which language a file is.
+        for value in ["unspecified", "set", "unset", ""] {
+            let parsed = parse_check_attr(&check_attr(&[("a.rs", value)])).unwrap();
+            assert_eq!(attribute_value(&parsed[0].2), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn several_paths_come_back_in_order() {
+        let parsed = parse_check_attr(&check_attr(&[
+            ("a.weird", "Rust"),
+            ("b.txt", "unspecified"),
+            ("c.tmpl", "HTML"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+            [
+                PathBuf::from("a.weird"),
+                PathBuf::from("b.txt"),
+                PathBuf::from("c.tmpl"),
+            ]
+        );
+        assert_eq!(attribute_value(&parsed[2].2), Some("HTML"));
+    }
+
+    #[test]
+    fn attribute_paths_with_spaces_and_non_ascii_survive_verbatim() {
+        let parsed = parse_check_attr(&check_attr(&[
+            ("dir with spaces/my file.weird", "Rust"),
+            ("테스트/파일.weird", "Python"),
+        ]))
+        .unwrap();
+        assert_eq!(parsed[0].0, PathBuf::from("dir with spaces/my file.weird"));
+        assert_eq!(parsed[1].0, PathBuf::from("테스트/파일.weird"));
+        assert_eq!(attribute_value(&parsed[1].2), Some("Python"));
+    }
+
+    #[test]
+    fn empty_check_attr_output_yields_no_records() {
+        assert!(parse_check_attr(b"").unwrap().is_empty());
+        assert!(parse_check_attr(b"\0").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_truncated_check_attr_record_is_an_error() {
+        // a path with no attribute or value after it
+        assert!(parse_check_attr(b"a.rs\0").is_err());
+        assert!(parse_check_attr(b"a.rs\0linguist-language").is_err());
+    }
+
+    #[test]
+    fn an_empty_attribute_value_names_no_language() {
+        // the trailing NUL leaves an empty value field rather than a short record
+        let parsed = parse_check_attr(b"a.rs\0linguist-language\0\0").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(attribute_value(&parsed[0].2), None);
     }
 
     // ---- git diff --name-status -z ---------------------------------------

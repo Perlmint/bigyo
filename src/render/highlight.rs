@@ -50,6 +50,19 @@ impl Assets {
             .map(|n| n.as_name())
     }
 
+    /// Every syntax name, sorted and deduplicated, for the language picker.
+    pub fn syntax_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .syntaxes
+            .syntaxes()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     fn theme(&self, name: &str) -> Result<&Theme> {
         let found = EmbeddedLazyThemeSet::theme_names()
             .iter()
@@ -253,6 +266,22 @@ mod tests {
             .highlighter(None, Some(Path::new("a/b/main.rs")), DEFAULT_THEME)
             .unwrap();
         assert_eq!(hl.syntax_name(), "Rust");
+    }
+
+    #[test]
+    fn syntax_names_are_sorted_and_unique() {
+        let assets = Assets::new();
+        let names = assets.syntax_names();
+        assert!(names.len() > 50, "bat ships a lot of syntaxes");
+        assert!(names.contains(&"Rust"), "{names:?}");
+        assert!(names.contains(&"Markdown"));
+
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        let mut deduped = names.clone();
+        deduped.dedup();
+        assert_eq!(names, deduped);
     }
 
     #[test]

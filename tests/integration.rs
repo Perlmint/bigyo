@@ -885,6 +885,9 @@ mod diff_mode {
 
         std::fs::write(p.join("src/a.rs"), "fn a() -> i32 {\n    2\n}\n").unwrap();
         std::fs::write(p.join("added.rs"), "fn added() {}\n").unwrap();
+        // Staged, because `git diff HEAD` never reports untracked files — the
+        // same blind spot `git difftool` has, and one bigyo inherits.
+        git(p, &["add", "added.rs"]);
         std::fs::remove_file(p.join("gone.rs")).unwrap();
         dir
     }
@@ -918,7 +921,10 @@ mod diff_mode {
         let repo = Repo::discover(dir.path()).unwrap().expect("a repo");
 
         let committed = repo.show("HEAD", Path::new("src/a.rs")).unwrap().unwrap();
-        assert_eq!(String::from_utf8(committed).unwrap(), "fn a() -> i32 {\n    1\n}\n");
+        assert_eq!(
+            String::from_utf8(committed).unwrap(),
+            "fn a() -> i32 {\n    1\n}\n"
+        );
 
         // an added file has no pre-image, which is not an error
         assert!(repo.show("HEAD", Path::new("added.rs")).unwrap().is_none());
@@ -964,5 +970,114 @@ mod diff_mode {
         let workspace = Workspace::from_diff(&repo, "HEAD", Some(Path::new("src"))).unwrap();
         assert_eq!(workspace.len(), 1);
         assert_eq!(workspace.files()[0].path.display().to_string(), "src/a.rs");
+    }
+}
+
+// ---- linguist-language ----------------------------------------------------
+
+mod gitattributes {
+    use std::path::Path;
+    use std::process::Command;
+
+    use bigyo::external::git::Repo;
+    use bigyo::merge::workspace::Workspace;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repo whose `.gitattributes` names a language for an extension bigyo
+    /// could not otherwise guess.
+    fn attributed_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+
+        git(p, &["init", "-q", "--initial-branch=main", "."]);
+        git(p, &["config", "user.email", "t@example.com"]);
+        git(p, &["config", "user.name", "T"]);
+
+        std::fs::write(p.join(".gitattributes"), "*.weird linguist-language=Rust\n").unwrap();
+        std::fs::write(p.join("a.weird"), "fn a() -> i32 {\n    1\n}\n").unwrap();
+        std::fs::write(p.join("plain.txt"), "hello\n").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-qm", "base"]);
+
+        std::fs::write(p.join("a.weird"), "fn a() -> i32 {\n    2\n}\n").unwrap();
+        std::fs::write(p.join("plain.txt"), "goodbye\n").unwrap();
+        dir
+    }
+
+    #[test]
+    #[ignore = "requires the `git` binary"]
+    fn the_attribute_is_read_for_the_paths_that_set_it() {
+        let dir = attributed_repo();
+        let repo = Repo::discover(dir.path()).unwrap().expect("a repo");
+
+        let languages = repo
+            .linguist_languages(&[
+                std::path::PathBuf::from("a.weird"),
+                std::path::PathBuf::from("plain.txt"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            languages.get(Path::new("a.weird")).map(String::as_str),
+            Some("Rust")
+        );
+        assert!(
+            !languages.contains_key(Path::new("plain.txt")),
+            "an unspecified attribute names no language"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the `git` binary"]
+    fn a_workspace_carries_the_attribute_onto_its_entries() {
+        let dir = attributed_repo();
+        let repo = Repo::discover(dir.path()).unwrap().expect("a repo");
+        let workspace = Workspace::from_diff(&repo, "HEAD", None).unwrap();
+
+        let entry = |name: &str| {
+            workspace
+                .files()
+                .iter()
+                .find(|f| f.path.to_str() == Some(name))
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+
+        // the whole point: an extension nothing could guess is named by the repo
+        assert_eq!(entry("a.weird").effective_language(), Some("Rust"));
+        assert_eq!(entry("plain.txt").effective_language(), None);
+
+        // but mergiraf is never told, since it reads the attribute itself
+        assert_eq!(entry("a.weird").override_language(), None);
+    }
+
+    #[test]
+    #[ignore = "requires the `git` binary"]
+    fn asking_outside_a_repository_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Repo::discover finds nothing, so there is nothing to ask; a workspace
+        // built from plain directories still works, just without attributes.
+        assert!(Repo::discover(dir.path()).unwrap().is_none());
+
+        let (old, new) = (dir.path().join("old"), dir.path().join("new"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(old.join("a.weird"), "1\n").unwrap();
+        std::fs::write(new.join("a.weird"), "2\n").unwrap();
+
+        let workspace = Workspace::from_dirs(&old, &new).unwrap();
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(workspace.files()[0].effective_language(), None);
     }
 }

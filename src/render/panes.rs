@@ -334,13 +334,7 @@ pub fn build_diff_panes(
         let mut changed = false;
 
         for (side, number, texts, highlights, ranges) in [
-            (
-                Side::Left,
-                row.left,
-                &old_lines,
-                &old_highlights,
-                &diff.lhs,
-            ),
+            (Side::Left, row.left, &old_lines, &old_highlights, &diff.lhs),
             (
                 Side::Right,
                 row.right,
@@ -442,11 +436,7 @@ fn has_phantom_last_line(text: &str) -> bool {
 fn drop_trailing_empty_row(rows: &mut Vec<AlignedRow>, base: &str, left: &str, right: &str) {
     drop_trailing_rows(
         rows,
-        &[
-            (Side::Left, left),
-            (Side::Base, base),
-            (Side::Right, right),
-        ],
+        &[(Side::Left, left), (Side::Base, base), (Side::Right, right)],
     );
 }
 
@@ -1107,7 +1097,8 @@ mod tests {
 
     // ---- two-way diffs ----------------------------------------------------
 
-    const D_OLD: &str = "fn compute(x: i32) -> i32 {\n    let y = x + 1;\n    let z = y * 2;\n    z\n}\n";
+    const D_OLD: &str =
+        "fn compute(x: i32) -> i32 {\n    let y = x + 1;\n    let z = y * 2;\n    z\n}\n";
     const D_NEW: &str = "fn compute(x: i32) -> i32 {\n    let y = x + 10;\n    x * 3\n}\n";
 
     /// The alignment difftastic reports for the two texts above.
@@ -1133,7 +1124,9 @@ mod tests {
 
     fn diff_doc(old: &str, new: &str, differ: &dyn Differ) -> (PaneDocument, DiffTheme) {
         let assets = Assets::new();
-        let hl = assets.highlighter(Some("rust"), None, DEFAULT_THEME).unwrap();
+        let hl = assets
+            .highlighter(Some("rust"), None, DEFAULT_THEME)
+            .unwrap();
         let theme = DiffTheme::default();
         let doc = build_diff_panes(old, new, &hl, differ, &theme);
         (doc, theme)
@@ -1200,7 +1193,12 @@ mod tests {
         let (doc, _) = diff_doc(D_OLD, D_OLD, &no_conflicts_differ());
         assert!(doc.rows.iter().all(|r| !r.changed));
         assert!(doc.hunks.is_empty());
-        assert!(doc.rows.iter().flat_map(|r| &r.cells).all(|c| c.bg.is_none()));
+        assert!(
+            doc.rows
+                .iter()
+                .flat_map(|r| &r.cells)
+                .all(|c| c.bg.is_none())
+        );
         assert_eq!(doc.len(), 5, "the trailing empty row is dropped");
     }
 
@@ -1211,7 +1209,9 @@ mod tests {
             fn diff(&self, _old: &str, new: &str) -> crate::external::difft::DiffResult {
                 use crate::external::difft::{DiffResult, line_count};
                 DiffResult {
-                    aligned: (0..line_count(new) as u32).map(|i| (None, Some(i))).collect(),
+                    aligned: (0..line_count(new) as u32)
+                        .map(|i| (None, Some(i)))
+                        .collect(),
                     ..DiffResult::default()
                 }
             }

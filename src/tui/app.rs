@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::external::git::Repo;
 use crate::external::mergiraf;
 use crate::merge::session::{MergeSession, Resolution};
-use crate::merge::workspace::{FileState, Workspace, repo_marker_labels};
+use crate::merge::workspace::{FileEntry, FileState, Workspace, repo_marker_labels};
 use crate::render::document::{DisplayRow, RowKind};
 use crate::render::highlight::Assets;
 use crate::render::panes::Cell;
@@ -63,7 +63,12 @@ pub enum Screen {
     Merge,
     /// The list of conflicted files, in directory mode.
     Files,
+    /// The list of languages to force on the open file.
+    Language,
 }
+
+/// The picker's first row, which clears the override.
+const AUTO_DETECT: &str = "(auto-detect)";
 
 /// Where a resolved file is written, and whether git is told about it.
 pub enum Destination {
@@ -81,10 +86,15 @@ pub struct App<'a> {
     screen: Screen,
     /// Row highlighted in the file list, which is not yet the open file.
     file_cursor: usize,
+    /// Row highlighted in the language list, and what is filtering it.
+    language_cursor: usize,
+    language_filter: String,
+    /// A language change waiting on confirmation, because applying it would
+    /// discard resolutions. `Some(None)` is a pending switch to auto-detect.
+    pending_language: Option<Option<String>>,
     focus: Focus,
     theme: DiffTheme,
     theme_name: String,
-    language: Option<String>,
     title: String,
     destination: Destination,
     /// Vertical offset per panel, indexed by [`Focus::index`].
@@ -106,16 +116,9 @@ impl<'a> App<'a> {
         mut workspace: Workspace,
         theme: DiffTheme,
         theme_name: String,
-        language: Option<String>,
         destination: Destination,
     ) -> Result<Self> {
-        let view = open_current(
-            assets,
-            &mut workspace,
-            &theme,
-            &theme_name,
-            language.as_deref(),
-        )?;
+        let view = open_current(assets, &mut workspace, &theme, &theme_name)?;
         let title = workspace
             .current()
             .map_or_else(String::new, |f| f.path.display().to_string());
@@ -127,10 +130,12 @@ impl<'a> App<'a> {
             view,
             screen: Screen::default(),
             file_cursor,
+            language_cursor: 0,
+            language_filter: String::new(),
+            pending_language: None,
             focus: Focus::default(),
             theme,
             theme_name,
-            language,
             title,
             destination,
             scroll: [0, 0],
@@ -187,7 +192,6 @@ impl<'a> App<'a> {
             &mut self.workspace,
             &self.theme,
             &self.theme_name,
-            self.language.as_deref(),
         ) {
             Ok(view) => {
                 self.view = view;
@@ -242,8 +246,26 @@ impl<'a> App<'a> {
 
     fn on_key(&mut self, key: KeyEvent) {
         self.status = None;
-        if self.screen == Screen::Files {
-            self.on_files_key(key);
+        match self.screen {
+            Screen::Files => return self.on_files_key(key),
+            Screen::Language => return self.on_language_key(key),
+            Screen::Merge => {}
+        }
+
+        // A pending confirmation owns enter and esc, which would otherwise
+        // do nothing and quit.
+        if self.pending_language.is_some() {
+            match key.code {
+                KeyCode::Enter => {
+                    let choice = self.pending_language.take().flatten();
+                    self.apply_language(choice);
+                }
+                KeyCode::Esc => {
+                    self.pending_language = None;
+                    self.status = Some("kept the current merge".into());
+                }
+                _ => self.restate_pending(),
+            }
             return;
         }
 
@@ -256,12 +278,15 @@ impl<'a> App<'a> {
                 self.file_cursor = self.workspace.current_index();
                 self.screen = Screen::Files;
             }
+            KeyCode::Char('L') => {
+                self.language_filter.clear();
+                self.language_cursor = 0;
+                self.screen = Screen::Language;
+            }
             KeyCode::Char(']') => self.change_file(true),
             KeyCode::Char('[') => self.change_file(false),
 
-            KeyCode::Tab | KeyCode::BackTab if !self.is_diff() => {
-                self.focus = self.focus.toggled()
-            }
+            KeyCode::Tab | KeyCode::BackTab if !self.is_diff() => self.focus = self.focus.toggled(),
 
             KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
@@ -326,6 +351,103 @@ impl<'a> App<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Languages matching the filter, `(auto-detect)` always first.
+    fn language_choices(&self) -> Vec<&str> {
+        let needle = self.language_filter.to_lowercase();
+        let mut out = vec![AUTO_DETECT];
+        out.extend(
+            self.assets
+                .syntax_names()
+                .into_iter()
+                .filter(|name| needle.is_empty() || name.to_lowercase().contains(&needle)),
+        );
+        out
+    }
+
+    fn on_language_key(&mut self, key: KeyEvent) {
+        let last = self.language_choices().len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => self.screen = Screen::Merge,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+
+            KeyCode::Down => self.language_cursor = (self.language_cursor + 1).min(last),
+            KeyCode::Up => self.language_cursor = self.language_cursor.saturating_sub(1),
+            KeyCode::Home => self.language_cursor = 0,
+            KeyCode::End => self.language_cursor = last,
+
+            KeyCode::Backspace => {
+                self.language_filter.pop();
+                self.language_cursor = 0;
+            }
+            KeyCode::Char(c) => {
+                self.language_filter.push(c);
+                self.language_cursor = 0;
+            }
+
+            KeyCode::Enter => {
+                let choice = self
+                    .language_choices()
+                    .get(self.language_cursor)
+                    .map(|name| (*name != AUTO_DETECT).then(|| (*name).to_owned()));
+                if let Some(choice) = choice {
+                    self.screen = Screen::Merge;
+                    self.request_language(choice);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply a language, or ask first when doing so would discard choices.
+    fn request_language(&mut self, choice: Option<String>) {
+        let resolved = self
+            .workspace
+            .current()
+            .filter(|f| !f.is_diff())
+            .and_then(|f| f.session.as_ref())
+            .map_or(0, MergeSession::resolved_count);
+
+        if resolved == 0 {
+            self.apply_language(choice);
+            return;
+        }
+        // Re-merging rebuilds the chunks, so the choices cannot survive it.
+        self.pending_language = Some(choice);
+        self.restate_pending();
+    }
+
+    fn restate_pending(&mut self) {
+        let Some(choice) = &self.pending_language else {
+            return;
+        };
+        let name = choice.clone().unwrap_or_else(|| "auto-detect".into());
+        let resolved = self.resolved_count();
+        self.status = Some(format!(
+            "re-merging as {name} discards {resolved} choice{} — enter to confirm, esc to cancel",
+            if resolved == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn apply_language(&mut self, choice: Option<String>) {
+        let Some(file) = self.workspace.current_mut() else {
+            return;
+        };
+        file.language = choice;
+        let name = file
+            .effective_language()
+            .map_or_else(|| "auto-detect".to_string(), str::to_owned);
+        // A merge has to be redone by mergiraf, not just recoloured.
+        if !file.is_diff() {
+            file.session = None;
+            file.saved = false;
+        }
+
+        self.reload();
+        if self.status.is_none() {
+            self.status = Some(format!("language: {name}"));
         }
     }
 
@@ -429,13 +551,17 @@ impl<'a> App<'a> {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        if self.screen == Screen::Files {
+        if self.screen != Screen::Merge {
             // Paragraph leaves cells it does not write, so the merge screen
             // would otherwise show through around a shorter list.
             Clear.render(frame.area(), frame.buffer_mut());
             let [body, status] =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
-            self.draw_files(frame, body);
+            match self.screen {
+                Screen::Files => self.draw_files(frame, body),
+                Screen::Language => self.draw_languages(frame, body),
+                Screen::Merge => unreachable!(),
+            }
             self.draw_status(frame, status);
             return;
         }
@@ -545,6 +671,69 @@ impl<'a> App<'a> {
                 styled(
                     label.to_string(),
                     Some(self.state_color(state)),
+                    self.view.page_bg,
+                ),
+            ]));
+        }
+
+        let mut para = Paragraph::new(lines);
+        if let Some(bg) = self.view.page_bg {
+            para = para.style(Style::default().bg(bg));
+        }
+        para.render(area, frame.buffer_mut());
+    }
+
+    /// The language list: what is in effect, and what you can force instead.
+    fn draw_languages(&self, frame: &mut Frame, area: Rect) {
+        let width = area.width as usize;
+        let current = self
+            .workspace
+            .current()
+            .and_then(FileEntry::effective_language)
+            .unwrap_or(AUTO_DETECT);
+        let header = section_label("LANGUAGE", current, width);
+
+        let mut lines = vec![Line::from(vec![
+            styled(header.clone(), Some(self.theme.focus_fg), self.view.page_bg),
+            styled(
+                "─".repeat(width.saturating_sub(display_width(&header))),
+                Some(self.theme.gutter_fg),
+                self.view.page_bg,
+            ),
+        ])];
+
+        // One row goes to the filter, so you can see what you have typed.
+        let filter = format!(" / {}", self.language_filter);
+        lines.push(Line::from(styled(
+            fit_name(&filter, width),
+            Some(self.theme.status_fg),
+            self.view.page_bg,
+        )));
+
+        let choices = self.language_choices();
+        let rows = (area.height as usize).saturating_sub(2);
+        let first = self.language_cursor.saturating_sub(rows.saturating_sub(1));
+
+        for (i, name) in choices.iter().enumerate().skip(first).take(rows) {
+            let in_effect = *name == current;
+            let marker = match (i == self.language_cursor, in_effect) {
+                (true, _) => "▸ ",
+                (false, true) => "· ",
+                (false, false) => "  ",
+            };
+            lines.push(Line::from(vec![
+                styled(
+                    marker.to_string(),
+                    Some(self.theme.focus_fg),
+                    self.view.page_bg,
+                ),
+                styled(
+                    fit_name(name, width.saturating_sub(2)),
+                    Some(if in_effect {
+                        self.theme.focus_fg
+                    } else {
+                        self.theme.status_fg
+                    }),
                     self.view.page_bg,
                 ),
             ]));
@@ -841,6 +1030,10 @@ impl<'a> App<'a> {
         };
         let left = match &self.status {
             Some(message) => format!(" {message} "),
+            None if self.screen == Screen::Language => format!(
+                " {} languages ",
+                self.language_choices().len().saturating_sub(1)
+            ),
             None if self.screen == Screen::Files => format!(
                 " {} files  ·  {} resolved ",
                 self.workspace.len(),
@@ -865,15 +1058,16 @@ impl<'a> App<'a> {
             ),
         };
         let right = match self.screen {
+            Screen::Language => " type to filter · enter esc ".to_string(),
             Screen::Files => " j/k enter esc q ".to_string(),
             Screen::Merge if self.is_diff() && self.workspace.len() > 1 => {
-                " f ]/[ n/p j/k q ".to_string()
+                " f L ]/[ n/p j/k q ".to_string()
             }
-            Screen::Merge if self.is_diff() => " n/p j/k h/l q ".to_string(),
+            Screen::Merge if self.is_diff() => " L n/p j/k h/l q ".to_string(),
             Screen::Merge if self.workspace.len() > 1 => {
-                " f ]/[ tab 1/2/3 b u n/p w q ".to_string()
+                " f L ]/[ tab 1/2/3 b u n/p w q ".to_string()
             }
-            Screen::Merge => " tab 1/2/3 b u n/p w q ".to_string(),
+            Screen::Merge => " L tab 1/2/3 b u n/p w q ".to_string(),
         };
         let pad =
             (area.width as usize).saturating_sub(display_width(&left) + display_width(&right));
@@ -897,11 +1091,14 @@ fn open_current<'a>(
     workspace: &mut Workspace,
     theme: &DiffTheme,
     theme_name: &str,
-    language: Option<&str>,
 ) -> Result<FileView<'a>> {
     let file = workspace
         .current_mut()
         .context("the workspace has no file to open")?;
+
+    // syntect and difftastic get the in-session choice if there is one, else
+    // whatever `linguist-language` said.
+    let language = file.effective_language().map(str::to_owned);
 
     if file.is_diff() {
         return FileView::new_diff(
@@ -910,15 +1107,22 @@ fn open_current<'a>(
             file.right.clone(),
             &file.path,
             file.names.clone(),
-            language,
+            language.as_deref(),
             theme_name,
             theme,
         );
     }
 
     if file.session.is_none() {
-        let merged =
-            mergiraf::merge_texts(&file.base, &file.left, &file.right, language, &file.path)?;
+        // Mergiraf reads the gitattributes itself, so only an explicit choice
+        // is worth overriding it with.
+        let merged = mergiraf::merge_texts(
+            &file.base,
+            &file.left,
+            &file.right,
+            file.override_language(),
+            &file.path,
+        )?;
         file.session = Some(MergeSession::new(
             merged.chunks,
             repo_marker_labels(&file.path),
@@ -934,7 +1138,7 @@ fn open_current<'a>(
         file.right.clone(),
         &file.path,
         file.names.clone(),
-        language,
+        language.as_deref(),
         theme_name,
         theme,
     )
@@ -1157,6 +1361,8 @@ mod tests {
             right,
             names: SectionNames::new("left.rs", "base.rs", "right.rs", path),
             kind: EntryKind::Merge,
+            attr_language: None,
+            language: None,
             session: Some(session),
             binary: false,
             saved: false,
@@ -1194,7 +1400,6 @@ mod tests {
                 Workspace::new(files),
                 self.theme.clone(),
                 DEFAULT_THEME.to_string(),
-                None,
                 destination,
             )
             .unwrap()
@@ -1438,7 +1643,11 @@ mod tests {
         assert_eq!(app.screen, Screen::Merge);
         assert_eq!(app.workspace.current_index(), 1);
         assert_eq!(app.title, "b.rs");
-        assert_eq!(app.session().unwrap().conflict_count(), 2, "b.rs's own session");
+        assert_eq!(
+            app.session().unwrap().conflict_count(),
+            2,
+            "b.rs's own session"
+        );
     }
 
     #[test]
@@ -1533,6 +1742,8 @@ mod tests {
                 merged: path.into(),
             },
             kind: EntryKind::Diff,
+            attr_language: None,
+            language: None,
             session: None,
             binary: false,
             saved: false,
@@ -1545,12 +1756,20 @@ mod tests {
         let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
         let out = render_to_string(&mut app, 96, 14);
 
-        assert!(!out.contains("MERGED"), "a diff has nothing to merge:\n{out}");
+        assert!(
+            !out.contains("MERGED"),
+            "a diff has nothing to merge:\n{out}"
+        );
         assert!(!out.contains("CONFLICT"), "{out}");
         let rows: Vec<&str> = out.lines().collect();
         assert!(rows[0].contains("OLD · old"), "{:?}", rows[0]);
         assert!(rows[0].contains("NEW · new"), "{:?}", rows[0]);
-        assert_eq!(rows[0].matches('┬').count(), 1, "two columns: {:?}", rows[0]);
+        assert_eq!(
+            rows[0].matches('┬').count(),
+            1,
+            "two columns: {:?}",
+            rows[0]
+        );
         assert_eq!(rows[1].matches('│').count(), 1, "{:?}", rows[1]);
     }
 
@@ -1585,11 +1804,22 @@ mod tests {
 
         let hunks = app.view.panes.hunks.clone();
         assert!(!hunks.is_empty(), "the fixture must differ");
+
+        // `n` clamps at the last hunk, so with one hunk it stays put.
         app.on_key(key('n'));
-        assert_eq!(app.selected, (hunks.len() - 1).min(1));
+        assert_eq!(app.selected, hunks.len() - 1);
         app.on_key(key('p'));
         assert_eq!(app.selected, 0);
-        assert_eq!(app.scroll[Focus::Panes.index()], hunks[0]);
+
+        // The hunk is on screen; whether that took any scrolling depends on
+        // whether the file fits, which is not what this is testing.
+        let start = app.scroll[Focus::Panes.index()];
+        let visible = start..start + app.viewport[Focus::Panes.index()];
+        assert!(
+            visible.contains(&hunks[0]),
+            "hunk {} not in {visible:?}",
+            hunks[0]
+        );
     }
 
     #[test]
@@ -1661,6 +1891,262 @@ mod tests {
         assert!(render_to_string(&mut app, 96, 16).contains("MERGED"));
         app.on_key(key(']'));
         assert!(!render_to_string(&mut app, 96, 16).contains("MERGED"));
+    }
+
+    // ---- the language picker ----------------------------------------------
+
+    #[test]
+    fn capital_l_opens_the_language_list_and_esc_closes_it() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        render_to_string(&mut app, 96, 14);
+
+        app.on_key(key('L'));
+        assert_eq!(app.screen, Screen::Language);
+        let out = render_to_string(&mut app, 60, 14);
+        assert!(out.contains("LANGUAGE"), "{out}");
+        assert!(out.contains(AUTO_DETECT), "{out}");
+
+        // The list is alphabetical and long, so Rust is off screen until the
+        // filter brings it up — which is the reason the filter exists.
+        for c in "rust".chars() {
+            app.on_key(key(c));
+        }
+        assert!(render_to_string(&mut app, 60, 14).contains("Rust"));
+
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Merge);
+        assert_eq!(app.workspace.current().unwrap().language, None);
+    }
+
+    #[test]
+    fn lowercase_l_still_scrolls_horizontally() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        render_to_string(&mut app, 96, 14);
+        app.on_key(key('l'));
+        assert_eq!(app.screen, Screen::Merge);
+        assert!(app.hscroll[Focus::Panes.index()] > 0);
+    }
+
+    #[test]
+    fn typing_filters_the_list_and_backspace_undoes_it() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        app.on_key(key('L'));
+        let all = app.language_choices().len();
+
+        for c in "rust".chars() {
+            app.on_key(key(c));
+        }
+        let filtered = app.language_choices();
+        assert!(filtered.len() < all, "the filter should narrow the list");
+        // case-insensitive, and (auto-detect) always survives
+        assert_eq!(filtered[0], AUTO_DETECT);
+        assert!(filtered.contains(&"Rust"), "{filtered:?}");
+
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.language_filter, "rus");
+        for _ in 0..5 {
+            app.on_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        assert_eq!(app.language_choices().len(), all);
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_leaves_only_auto_detect() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        app.on_key(key('L'));
+        for c in "zzzznotalanguage".chars() {
+            app.on_key(key(c));
+        }
+        assert_eq!(app.language_choices(), vec![AUTO_DETECT]);
+        render_to_string(&mut app, 60, 14);
+        // and enter on it is harmless
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.workspace.current().unwrap().language, None);
+    }
+
+    #[test]
+    fn the_cursor_clamps_at_both_ends_of_the_list() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        app.on_key(key('L'));
+
+        for _ in 0..500 {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        assert_eq!(app.language_cursor, app.language_choices().len() - 1);
+        for _ in 0..500 {
+            app.on_key(KeyEvent::from(KeyCode::Up));
+        }
+        assert_eq!(app.language_cursor, 0);
+    }
+
+    /// Move the cursor onto a named language and apply it.
+    fn choose(app: &mut App<'_>, name: &str) {
+        app.on_key(key('L'));
+        for c in name.chars() {
+            app.on_key(key(c));
+        }
+        let at = app
+            .language_choices()
+            .iter()
+            .position(|n| *n == name)
+            .unwrap_or_else(|| panic!("{name} not in {:?}", app.language_choices()));
+        for _ in 0..at {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+    }
+
+    #[test]
+    fn choosing_a_language_rebuilds_a_diff_immediately() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        render_to_string(&mut app, 96, 14);
+        assert_eq!(app.view.syntax, "Rust", "detected from the .rs path");
+
+        choose(&mut app, "Markdown");
+        assert_eq!(app.screen, Screen::Merge, "no confirmation for a diff");
+        assert!(app.pending_language.is_none());
+        assert_eq!(
+            app.workspace.current().unwrap().language.as_deref(),
+            Some("Markdown")
+        );
+        assert_eq!(app.view.syntax, "Markdown", "the view really rebuilt");
+    }
+
+    #[test]
+    fn auto_detect_clears_the_override() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        render_to_string(&mut app, 96, 14);
+
+        choose(&mut app, "Markdown");
+        assert_eq!(app.view.syntax, "Markdown");
+
+        app.on_key(key('L'));
+        app.on_key(KeyEvent::from(KeyCode::Enter)); // cursor 0 is (auto-detect)
+        assert_eq!(app.workspace.current().unwrap().language, None);
+        assert_eq!(app.view.syntax, "Rust", "detection takes over again");
+    }
+
+    #[test]
+    fn the_attribute_supplies_the_language_when_nothing_is_chosen() {
+        let h = Harness::new();
+        let mut entry = diff_file("a.weird", D_OLD, D_NEW);
+        entry.attr_language = Some("Markdown".into());
+        let mut app = h.app(vec![entry]);
+        render_to_string(&mut app, 96, 14);
+        assert_eq!(app.view.syntax, "Markdown", "from linguist-language");
+
+        // and the list shows it as the one in effect
+        app.on_key(key('L'));
+        assert!(render_to_string(&mut app, 60, 14).contains("LANGUAGE · Markdown"));
+    }
+
+    #[test]
+    fn a_merge_with_nothing_resolved_changes_language_without_asking() {
+        let h = Harness::new();
+        let mut app = h.app(vec![file("a.rs", 1)]);
+        render_to_string(&mut app, 96, 16);
+
+        choose(&mut app, "Markdown");
+        assert!(app.pending_language.is_none(), "nothing to discard");
+        assert_eq!(
+            app.workspace.current().unwrap().language.as_deref(),
+            Some("Markdown")
+        );
+        // mergiraf re-ran during the reload, so there is a session again — a
+        // new one, built with the language this time.
+        assert!(app.workspace.current().unwrap().session.is_some());
+        assert_eq!(app.resolved_count(), 0);
+    }
+
+    #[test]
+    fn a_merge_with_choices_asks_before_discarding_them() {
+        let h = Harness::new();
+        let mut app = h.app(vec![file("a.rs", 2)]);
+        render_to_string(&mut app, 96, 16);
+        app.on_key(key('1'));
+        assert_eq!(app.resolved_count(), 1);
+
+        choose(&mut app, "Markdown");
+        assert_eq!(app.pending_language, Some(Some("Markdown".into())));
+        assert_eq!(
+            app.workspace.current().unwrap().language,
+            None,
+            "nothing is applied until it is confirmed"
+        );
+        assert!(app.workspace.current().unwrap().session.is_some());
+        let out = render_to_string(&mut app, 96, 16);
+        assert!(out.contains("discards 1 choice"), "{out}");
+        assert!(out.contains("enter to confirm"), "{out}");
+    }
+
+    #[test]
+    fn cancelling_the_confirmation_leaves_the_merge_alone() {
+        let h = Harness::new();
+        let mut app = h.app(vec![file("a.rs", 2)]);
+        render_to_string(&mut app, 96, 16);
+        app.on_key(key('1'));
+
+        choose(&mut app, "Markdown");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+
+        assert!(app.pending_language.is_none());
+        assert!(!app.quit, "esc must cancel, not quit");
+        assert_eq!(app.workspace.current().unwrap().language, None);
+        assert_eq!(app.resolved_count(), 1, "the choice survived");
+    }
+
+    #[test]
+    fn confirming_applies_the_language_and_drops_the_session() {
+        let h = Harness::new();
+        let mut app = h.app(vec![file("a.rs", 2)]);
+        render_to_string(&mut app, 96, 16);
+        app.on_key(key('1'));
+
+        choose(&mut app, "Markdown");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(app.pending_language.is_none());
+        assert_eq!(
+            app.workspace.current().unwrap().language.as_deref(),
+            Some("Markdown")
+        );
+        assert_eq!(
+            app.resolved_count(),
+            0,
+            "mergiraf re-ran, so the old chunks and their choices are gone"
+        );
+    }
+
+    #[test]
+    fn a_pending_confirmation_swallows_other_keys() {
+        let h = Harness::new();
+        let mut app = h.app(vec![file("a.rs", 2)]);
+        render_to_string(&mut app, 96, 16);
+        app.on_key(key('1'));
+        choose(&mut app, "Markdown");
+
+        app.on_key(key('j'));
+        assert!(app.pending_language.is_some(), "still waiting");
+        assert!(app.status.as_deref().unwrap().contains("enter to confirm"));
+        app.on_key(key('q'));
+        assert!(!app.quit, "q must not slip past the question");
+    }
+
+    #[test]
+    fn the_language_list_renders_at_degenerate_sizes() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        app.on_key(key('L'));
+        for (w, hh) in [(6, 3), (1, 2), (3, 4), (20, 2), (96, 2)] {
+            render_to_string(&mut app, w, hh);
+        }
     }
 
     // ---- saving -----------------------------------------------------------

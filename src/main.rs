@@ -27,10 +27,6 @@ struct Args {
     #[arg(num_args = 0..=3)]
     paths: Vec<PathBuf>,
 
-    /// Override language detection (e.g. `rust`, `python`)
-    #[arg(short = 'L', long)]
-    language: Option<String>,
-
     /// Syntax theme, as named by bat
     #[arg(short, long, default_value = DEFAULT_THEME)]
     theme: String,
@@ -87,14 +83,7 @@ fn main() -> Result<()> {
         ),
     };
 
-    let app = App::new(
-        &assets,
-        workspace,
-        theme,
-        args.theme.clone(),
-        args.language.clone(),
-        destination,
-    )?;
+    let app = App::new(&assets, workspace, theme, args.theme.clone(), destination)?;
 
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
@@ -112,13 +101,9 @@ fn single_file(args: &Args) -> Result<(Workspace, Destination)> {
     }
 
     let display: &Path = args.path_name.as_deref().unwrap_or(left);
-    let merged = mergiraf::merge(
-        base,
-        left,
-        right,
-        args.language.as_deref(),
-        args.path_name.as_deref(),
-    )?;
+    // No language is passed: mergiraf reads `mergiraf.language` and
+    // `linguist-language` itself, with a precedence of its own.
+    let merged = mergiraf::merge(base, left, right, None, args.path_name.as_deref())?;
 
     let read =
         |p: &Path| std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()));
@@ -134,6 +119,8 @@ fn single_file(args: &Args) -> Result<(Workspace, Destination)> {
         // one it shows; the shared directories are dropped.
         names: SectionNames::new(&name(left), &name(base), &name(right), &name(&output)),
         kind: EntryKind::Merge,
+        attr_language: None,
+        language: None,
         session: Some(MergeSession::new(
             merged.chunks,
             MarkerLabels {
