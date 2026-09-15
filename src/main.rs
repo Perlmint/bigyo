@@ -14,13 +14,68 @@ use bigyo::render::panes::SectionNames;
 use bigyo::render::theme::DiffTheme;
 use bigyo::tui::app::{App, Destination};
 
+/// Shown by `--help`, where there is room for it; `-h` stays short.
+const GIT_GUIDE: &str = "\
+MODES:
+  bigyo <base> <left> <right>   resolve one merge, as git mergetool passes it
+  bigyo <old> <new>             diff two files, or two directories
+  bigyo                         resolve every conflicted file in the repository
+  bigyo <path>                  the same, narrowed to a path
+  bigyo --diff [<rev>]          diff a revision against the working tree
+
+GIT DIFFTOOL:
+  git config difftool.bigyo.cmd 'bigyo \"$LOCAL\" \"$REMOTE\" --path-name \"$MERGED\"'
+  git difftool -t bigyo [<rev>]            # one launch per changed file
+  git difftool -t bigyo --dir-diff [<rev>] # one launch for all of them
+
+  Make it the default:  git config diff.tool bigyo
+
+GIT MERGETOOL:
+  git config mergetool.bigyo.cmd 'bigyo \"$BASE\" \"$LOCAL\" \"$REMOTE\" -o \"$MERGED\"'
+  git mergetool -t bigyo
+
+  Make it the default:  git config merge.tool bigyo
+
+  Note the argument order: bigyo takes <base> <left> <right>, so $BASE (the
+  common ancestor) comes first, then $LOCAL (ours) and $REMOTE (theirs).
+
+  Leave mergetool.bigyo.trustExitCode unset. bigyo exits 0 even if you quit
+  without deciding every conflict, so let git ask whether the merge succeeded
+  rather than have it assume so and stage a file that still has markers in it.
+
+WITHOUT GIT'S WRAPPERS:
+  bigyo's own repository modes do the same job in a single launch and know
+  more about what they are doing:
+
+    bigyo           every conflicted file; resolving one writes it and `git add`s it
+    bigyo --diff    every change against HEAD
+
+  Both open a file list on `f`, and `]`/`[` step between files.
+
+  --path-name is where $MERGED goes: the real path of the file being compared.
+  git's temp files keep the original extension, so detection usually survives
+  without it — but mergetool mangles the basename of a file that has no
+  extension (Makefile becomes Makefile_BASE_123), which defeats detection for
+  the highlighting and for the structural merge alike. bigyo falls back to -o
+  for the name, which is why the mergetool line above needs nothing extra.
+
+LANGUAGE:
+  Resolved per file: whatever you pick in-session with `L`, else the
+  linguist-language gitattribute, else the file extension.
+";
+
 #[derive(Parser, Debug)]
 #[command(name = "bigyo", version, about, long_about = None)]
 #[command(after_help = "\
 MODES:
-  bigyo <base> <left> <right>   resolve one file, e.g. as a git mergetool
+  bigyo <base> <left> <right>   resolve one merge, as git mergetool passes it
+  bigyo <old> <new>             diff two files, or two directories
   bigyo                         resolve every conflicted file in the repository
-  bigyo <path>                  the same, narrowed to a path")]
+  bigyo <path>                  the same, narrowed to a path
+  bigyo --diff [<rev>]          diff a revision against the working tree
+
+Run `bigyo --help` for how to wire bigyo into git difftool and mergetool.")]
+#[command(after_long_help = GIT_GUIDE)]
 struct Args {
     /// `<base> <left> <right>` for one file, a path to narrow directory mode,
     /// or nothing for the whole repository
@@ -48,6 +103,18 @@ struct Args {
     /// List the available syntax themes and exit
     #[arg(long)]
     list_themes: bool,
+}
+
+impl Args {
+    /// `--path-name`, treating an empty value as absent.
+    ///
+    /// `git difftool --dir-diff` substitutes an empty `$MERGED`, so the
+    /// documented config really does hand over `--path-name ""`.
+    fn path_name(&self) -> Option<&Path> {
+        self.path_name
+            .as_deref()
+            .filter(|p| !p.as_os_str().is_empty())
+    }
 }
 
 fn main() -> Result<()> {
@@ -100,10 +167,14 @@ fn single_file(args: &Args) -> Result<(Workspace, Destination)> {
         }
     }
 
-    let display: &Path = args.path_name.as_deref().unwrap_or(left);
+    // git mergetool mangles the basename of an extensionless file
+    // (`Makefile` becomes `Makefile_BASE_123`), which defeats detection for
+    // syntect *and* mergiraf. `-o` is `$MERGED` there — the real name — so it
+    // stands in when --path-name was not given.
+    let display: &Path = args.path_name().or(args.output.as_deref()).unwrap_or(left);
     // No language is passed: mergiraf reads `mergiraf.language` and
     // `linguist-language` itself, with a precedence of its own.
-    let merged = mergiraf::merge(base, left, right, None, args.path_name.as_deref())?;
+    let merged = mergiraf::merge(base, left, right, None, Some(display))?;
 
     let read =
         |p: &Path| std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()));
@@ -157,7 +228,7 @@ fn two_way(args: &Args) -> Result<Option<(Workspace, Destination)>> {
     } else {
         // `--path-name` is where $MERGED goes: the real path of the file being
         // compared, which is what should drive language detection and the title.
-        let display = args.path_name.as_deref().unwrap_or(new);
+        let display = args.path_name().unwrap_or(new);
         Workspace::from_pair(old, new, display)?
     };
 

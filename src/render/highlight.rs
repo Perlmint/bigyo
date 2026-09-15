@@ -84,8 +84,15 @@ impl Assets {
         {
             return s;
         }
-        if let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str())
-            && let Some(s) = self.syntaxes.find_syntax_by_extension(ext)
+        // The whole file name first: syntaxes list names like `Makefile` and
+        // `Dockerfile` among their extensions, and `CMakeLists.txt` would
+        // otherwise be read as plain text on the strength of its `.txt`.
+        let by = |name: Option<&std::ffi::OsStr>| {
+            name.and_then(|n| n.to_str())
+                .and_then(|n| self.syntaxes.find_syntax_by_extension(n))
+        };
+        if let Some(s) =
+            by(path.and_then(|p| p.file_name())).or_else(|| by(path.and_then(|p| p.extension())))
         {
             return s;
         }
@@ -248,6 +255,22 @@ mod tests {
             hl.line(&mut a, "    let x = 1;"),
             hl.line(&mut b, "    let x = 1;")
         );
+    }
+
+    #[test]
+    fn a_name_without_an_extension_is_still_recognised() {
+        let assets = Assets::new();
+        let syntax = |p: &str| {
+            assets
+                .highlighter(None, Some(Path::new(p)), DEFAULT_THEME)
+                .unwrap()
+                .syntax_name()
+                .to_owned()
+        };
+        assert_eq!(syntax("Makefile"), "Makefile");
+        assert_eq!(syntax("src/Makefile"), "Makefile");
+        // and a name whose extension lies about it
+        assert_eq!(syntax("CMakeLists.txt"), "CMake");
     }
 
     #[test]

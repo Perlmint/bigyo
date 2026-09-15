@@ -686,12 +686,20 @@ impl<'a> App<'a> {
     /// The language list: what is in effect, and what you can force instead.
     fn draw_languages(&self, frame: &mut Frame, area: Rect) {
         let width = area.width as usize;
+        // `current` is what a row is marked against — an explicit choice, or
+        // `(auto-detect)`. The header says what is actually in use, which with
+        // nothing chosen is whatever detection landed on.
         let current = self
             .workspace
             .current()
             .and_then(FileEntry::effective_language)
             .unwrap_or(AUTO_DETECT);
-        let header = section_label("LANGUAGE", current, width);
+        let in_use = if current == AUTO_DETECT {
+            format!("{} (detected)", self.view.syntax)
+        } else {
+            current.to_owned()
+        };
+        let header = section_label("LANGUAGE", &in_use, width);
 
         let mut lines = vec![Line::from(vec![
             styled(header.clone(), Some(self.theme.focus_fg), self.view.page_bg),
@@ -1020,13 +1028,14 @@ impl<'a> App<'a> {
         // Only worth naming the file's place when there is more than one.
         let file = if self.workspace.len() > 1 {
             format!(
-                "{} [{}/{}]",
+                "{} [{}/{}] [{}]",
                 self.title,
                 self.workspace.current_index() + 1,
-                self.workspace.len()
+                self.workspace.len(),
+                self.view.syntax,
             )
         } else {
-            self.title.clone()
+            format!("{} [{}]", self.title, self.view.syntax)
         };
         let left = match &self.status {
             Some(message) => format!(" {message} "),

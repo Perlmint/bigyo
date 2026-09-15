@@ -58,11 +58,11 @@ impl<'a> FileView<'a> {
         theme: &DiffTheme,
     ) -> Result<Self> {
         let highlighter = assets.highlighter(language, Some(display_path), theme_name)?;
-        let extension = display_path
-            .extension()
-            .and_then(|e| e.to_str())
+        let file_name = display_path
+            .file_name()
+            .and_then(|n| n.to_str())
             .map(str::to_owned);
-        let differ = CachingDiffer::new(DifftCli::new(language.map(str::to_owned), extension));
+        let differ = CachingDiffer::new(DifftCli::new(language.map(str::to_owned), file_name));
 
         let mut view = Self {
             page_bg: highlighter.background,
@@ -120,11 +120,11 @@ impl<'a> FileView<'a> {
         theme_name: &str,
     ) -> Result<Self> {
         let highlighter = assets.highlighter(language, Some(display_path), theme_name)?;
-        let extension = display_path
-            .extension()
-            .and_then(|e| e.to_str())
+        let file_name = display_path
+            .file_name()
+            .and_then(|n| n.to_str())
             .map(str::to_owned);
-        let differ = CachingDiffer::new(DifftCli::new(language.map(str::to_owned), extension));
+        let differ = CachingDiffer::new(DifftCli::new(language.map(str::to_owned), file_name));
         Ok(Self {
             page_bg: highlighter.background,
             syntax: highlighter.syntax_name().to_owned(),

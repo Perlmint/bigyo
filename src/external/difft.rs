@@ -191,15 +191,18 @@ pub struct DifftCli {
     /// Passed to `--override='*:<lang>'` so difftastic doesn't have to guess a
     /// language from the temp file names.
     pub language: Option<String>,
-    /// Extension to give the temp files when no language override is set.
-    pub extension: Option<String>,
+    /// The compared file's own name, given to the temp files so difftastic can
+    /// detect from it. A name is used rather than just an extension because
+    /// difftastic matches whole names too — `Makefile` has no extension to
+    /// match on, and `CMakeLists.txt`'s would be misleading.
+    pub file_name: Option<String>,
 }
 
 impl DifftCli {
-    pub fn new(language: Option<String>, extension: Option<String>) -> Self {
+    pub fn new(language: Option<String>, file_name: Option<String>) -> Self {
         Self {
             language,
-            extension,
+            file_name,
         }
     }
 
@@ -216,11 +219,18 @@ impl DifftCli {
 
     fn run(&self, lhs: &str, rhs: &str) -> Result<DiffFile> {
         let dir = tempfile::tempdir().context("creating temp dir for difft")?;
-        let ext = self.extension.as_deref().unwrap_or("txt");
-        let lhs_path = dir.path().join(format!("lhs.{ext}"));
-        let rhs_path = dir.path().join(format!("rhs.{ext}"));
-        std::fs::write(&lhs_path, lhs)?;
-        std::fs::write(&rhs_path, rhs)?;
+        // Both sides keep the real file name, in their own subdirectory, so
+        // difftastic sees the name it would have seen on disk.
+        let name = self.file_name.as_deref().unwrap_or("file.txt");
+        let write = |side: &str, text: &str| -> Result<std::path::PathBuf> {
+            let dir = dir.path().join(side);
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(name);
+            std::fs::write(&path, text)?;
+            Ok(path)
+        };
+        let lhs_path = write("lhs", lhs)?;
+        let rhs_path = write("rhs", rhs)?;
 
         let mut cmd = Command::new("difft");
         cmd.env("DFT_UNSTABLE", "yes").arg("--display").arg("json");
