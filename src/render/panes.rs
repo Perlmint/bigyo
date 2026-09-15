@@ -125,6 +125,10 @@ impl PaneRow {
 
 #[derive(Clone, Debug, Default)]
 pub struct PaneDocument {
+    /// Which columns this document has, in order: three for a merge, two for a
+    /// diff. Cells stay indexed by [`Side::index`], so a diff simply never
+    /// fills the base slot.
+    pub columns: Vec<Side>,
     pub rows: Vec<PaneRow>,
     /// First row of each run of changed rows.
     pub hunks: Vec<usize>,
@@ -189,48 +193,25 @@ pub fn build_panes(
         let mut cells: [Cell; 3] = Default::default();
         let mut changed = false;
 
-        for side in Side::ALL {
+        for side in Side::MERGE {
             let s = side.index();
-            let Some(n) = numbers[s].map(|n| n as usize) else {
-                // The file has no line here at all.
-                cells[s] = Cell {
-                    line_no: None,
-                    bg: Some(theme.gap_bg),
-                    spans: Vec::new(),
-                };
-                changed = true;
-                continue;
-            };
-            let text = texts[s].get(n).copied().unwrap_or_default();
-            let emphasis = ranges[s].get(n as u32);
-            // A line counts as changed when the diff flagged bytes in it, or
-            // when its counterpart on the base side is missing entirely.
-            let is_changed = !emphasis.is_empty() || row.has_gap();
-            let (bg, emph_bg) = if is_changed {
-                theme.side_colors(side)
-            } else {
-                (None, None)
-            };
-            changed |= is_changed;
-
-            cells[s] = Cell {
-                line_no: Some(n + 1),
-                bg,
-                spans: overlay_spans(
-                    text,
-                    highlights[s].get(n).map_or(&[][..], Vec::as_slice),
-                    emphasis,
-                    bg,
-                    emph_bg,
-                ),
-            };
+            changed |= fill_cell(
+                &mut cells[s],
+                side,
+                numbers[s],
+                &texts[s],
+                &highlights[s],
+                ranges[s],
+                row.has_gap(),
+                theme,
+            );
         }
 
         let conflict = owners[index];
         if let Some(c) = conflict {
             // The region is the unit of work, so it outranks the per-line tint.
             let resolution = session.resolution(c);
-            for side in Side::ALL {
+            for side in Side::MERGE {
                 let cell = &mut cells[side.index()];
                 if cell.is_gap() {
                     continue;
@@ -254,8 +235,140 @@ pub fn build_panes(
         });
     }
 
+    doc.columns = Side::MERGE.to_vec();
     doc.hunks = hunk_starts(&doc.rows);
     doc.conflicts = region_ranges(&doc.rows, base_ranges.len());
+    doc
+}
+
+/// Build one cell, returning whether its line counts as changed.
+///
+/// Shared by the three-column merge and the two-column diff: the only thing
+/// that differs between them is how many sides there are.
+#[allow(clippy::too_many_arguments)]
+fn fill_cell(
+    cell: &mut Cell,
+    side: Side,
+    number: Option<u32>,
+    texts: &[&str],
+    highlights: &[Vec<(std::ops::Range<usize>, Color)>],
+    ranges: &SideRanges,
+    row_has_gap: bool,
+    theme: &DiffTheme,
+) -> bool {
+    let Some(n) = number.map(|n| n as usize) else {
+        // The file has no line here at all.
+        *cell = Cell {
+            line_no: None,
+            bg: Some(theme.gap_bg),
+            spans: Vec::new(),
+        };
+        return true;
+    };
+
+    let text = texts.get(n).copied().unwrap_or_default();
+    let emphasis = ranges.get(n as u32);
+    // A line counts as changed when the diff flagged bytes in it, or when its
+    // counterpart on the other side is missing entirely.
+    let is_changed = !emphasis.is_empty() || row_has_gap;
+    let (bg, emph_bg) = if is_changed {
+        theme.side_colors(side)
+    } else {
+        (None, None)
+    };
+
+    *cell = Cell {
+        line_no: Some(n + 1),
+        bg,
+        spans: overlay_spans(
+            text,
+            highlights.get(n).map_or(&[][..], Vec::as_slice),
+            emphasis,
+            bg,
+            emph_bg,
+        ),
+    };
+    is_changed
+}
+
+/// Build the two-column document for a diff.
+///
+/// Difftastic's `aligned_lines` *is* the two-way alignment, so unlike the merge
+/// there is no join to do — [`align3`] is not involved at all. A diff has hunks
+/// but no conflict regions, so `conflicts` stays empty.
+pub fn build_diff_panes(
+    old: &str,
+    new: &str,
+    highlighter: &Highlighter<'_>,
+    differ: &dyn Differ,
+    theme: &DiffTheme,
+) -> PaneDocument {
+    let diff = differ.diff(old, new);
+
+    // Split on '\n' rather than lines() so the indices match difftastic's.
+    let old_lines: Vec<&str> = old.split('\n').collect();
+    let new_lines: Vec<&str> = new.split('\n').collect();
+    let old_highlights = highlighter.file(&old_lines);
+    let new_highlights = highlighter.file(&new_lines);
+
+    let mut aligned: Vec<AlignedRow> = diff
+        .aligned
+        .iter()
+        .map(|&(old, new)| AlignedRow {
+            left: old,
+            base: None,
+            right: new,
+        })
+        .collect();
+    drop_trailing_rows(&mut aligned, &[(Side::Left, old), (Side::Right, new)]);
+
+    let mut doc = PaneDocument {
+        columns: Side::DIFF.to_vec(),
+        ..PaneDocument::default()
+    };
+    for row in &aligned {
+        let mut cells: [Cell; 3] = Default::default();
+        // A diff row gaps only when one of *its two* sides is missing; the
+        // unused base slot must not count.
+        let has_gap = row.left.is_none() || row.right.is_none();
+        let mut changed = false;
+
+        for (side, number, texts, highlights, ranges) in [
+            (
+                Side::Left,
+                row.left,
+                &old_lines,
+                &old_highlights,
+                &diff.lhs,
+            ),
+            (
+                Side::Right,
+                row.right,
+                &new_lines,
+                &new_highlights,
+                &diff.rhs,
+            ),
+        ] {
+            changed |= fill_cell(
+                &mut cells[side.index()],
+                side,
+                number,
+                texts,
+                highlights,
+                ranges,
+                has_gap,
+                theme,
+            );
+        }
+
+        doc.rows.push(PaneRow {
+            cells,
+            changed,
+            conflict: None,
+        });
+    }
+
+    doc.hunks = hunk_starts(&doc.rows);
     doc
 }
 
@@ -327,6 +440,26 @@ fn has_phantom_last_line(text: &str) -> bool {
 /// Drop the phantom final row that `split('\n')` leaves behind — every file
 /// would otherwise gain a trailing blank row.
 fn drop_trailing_empty_row(rows: &mut Vec<AlignedRow>, base: &str, left: &str, right: &str) {
+    drop_trailing_rows(
+        rows,
+        &[
+            (Side::Left, left),
+            (Side::Base, base),
+            (Side::Right, right),
+        ],
+    );
+}
+
+/// Drop the phantom final row for whichever columns a document actually has.
+///
+/// A diff has no base column, so including it would compare against a text that
+/// is not on screen.
+fn drop_trailing_rows(rows: &mut Vec<AlignedRow>, sides: &[(Side, &str)]) {
+    let number = |row: &AlignedRow, side: Side| match side {
+        Side::Left => row.left,
+        Side::Base => row.base,
+        Side::Right => row.right,
+    };
     let is_phantom = |n: Option<u32>, text: &str| match n {
         // A gap is vacuously phantom: nothing of that file is shown here.
         None => true,
@@ -334,9 +467,9 @@ fn drop_trailing_empty_row(rows: &mut Vec<AlignedRow>, base: &str, left: &str, r
     };
 
     if let Some(row) = rows.last()
-        && is_phantom(row.left, left)
-        && is_phantom(row.base, base)
-        && is_phantom(row.right, right)
+        && sides
+            .iter()
+            .all(|&(side, text)| is_phantom(number(row, side), text))
     {
         rows.pop();
     }
@@ -723,7 +856,7 @@ mod tests {
     fn rows_in_an_undecided_region_take_the_conflict_tint() {
         let (doc, theme) = build_with(&multi_session());
         for row in &doc.rows[1..5] {
-            for side in Side::ALL {
+            for side in Side::MERGE {
                 let cell = row.cell(side);
                 let expected = if cell.is_gap() {
                     theme.gap_bg
@@ -747,7 +880,7 @@ mod tests {
         let (doc, theme) = build_with(&session);
 
         for row in &doc.rows[1..5] {
-            for side in Side::ALL {
+            for side in Side::MERGE {
                 let cell = row.cell(side);
                 if cell.is_gap() {
                     continue;
@@ -777,7 +910,7 @@ mod tests {
             let mut session = multi_session();
             session.set_resolution(0, resolution);
             let (doc, theme) = build_with(&session);
-            Side::ALL
+            Side::MERGE
                 .into_iter()
                 .filter(|&side| {
                     let cell = doc.rows[1].cell(side);
@@ -803,7 +936,7 @@ mod tests {
     #[test]
     fn an_undecided_region_keeps_every_side_lit_and_coloured() {
         let (doc, theme) = build_with(&multi_session());
-        for side in Side::ALL {
+        for side in Side::MERGE {
             let cell = doc.rows[1].cell(side);
             if cell.is_gap() {
                 continue;
@@ -970,6 +1103,138 @@ mod tests {
             Some(theme.conflict_bg),
             "the one still open"
         );
+    }
+
+    // ---- two-way diffs ----------------------------------------------------
+
+    const D_OLD: &str = "fn compute(x: i32) -> i32 {\n    let y = x + 1;\n    let z = y * 2;\n    z\n}\n";
+    const D_NEW: &str = "fn compute(x: i32) -> i32 {\n    let y = x + 10;\n    x * 3\n}\n";
+
+    /// The alignment difftastic reports for the two texts above.
+    struct DiffDiffer;
+    impl Differ for DiffDiffer {
+        fn diff(&self, _old: &str, _new: &str) -> crate::external::difft::DiffResult {
+            use crate::external::difft::DiffResult;
+            DiffResult {
+                aligned: vec![
+                    (Some(0), Some(0)),
+                    (Some(1), Some(1)),
+                    (Some(2), None),
+                    (Some(3), Some(2)),
+                    (Some(4), Some(3)),
+                    (Some(5), Some(4)),
+                ],
+                // `1` -> `10` on line 1, and the replaced body
+                lhs: SideRanges(HashMap::from([(1, vec![16..17]), (3, vec![4..5])])),
+                rhs: SideRanges(HashMap::from([(1, vec![16..18]), (2, vec![4..9])])),
+            }
+        }
+    }
+
+    fn diff_doc(old: &str, new: &str, differ: &dyn Differ) -> (PaneDocument, DiffTheme) {
+        let assets = Assets::new();
+        let hl = assets.highlighter(Some("rust"), None, DEFAULT_THEME).unwrap();
+        let theme = DiffTheme::default();
+        let doc = build_diff_panes(old, new, &hl, differ, &theme);
+        (doc, theme)
+    }
+
+    #[test]
+    fn a_diff_has_two_columns_and_no_conflict_regions() {
+        let (doc, _) = diff_doc(D_OLD, D_NEW, &DiffDiffer);
+        assert_eq!(doc.columns, vec![Side::Left, Side::Right]);
+        assert!(doc.conflicts.is_empty(), "a diff has hunks, not regions");
+        assert!(doc.rows.iter().all(|r| r.conflict.is_none()));
+        // six aligned rows, minus the dropped trailing empty one
+        assert_eq!(doc.len(), 5);
+    }
+
+    #[test]
+    fn a_line_only_one_side_has_gaps_the_other() {
+        let (doc, theme) = diff_doc(D_OLD, D_NEW, &DiffDiffer);
+        let row = &doc.rows[2];
+        assert_eq!(row.cell(Side::Left).text(), "    let z = y * 2;");
+        assert!(row.cell(Side::Right).is_gap());
+        assert_eq!(row.cell(Side::Right).bg, Some(theme.gap_bg));
+        assert!(row.cell(Side::Right).spans.is_empty());
+        assert!(row.changed);
+    }
+
+    #[test]
+    fn changed_lines_carry_their_side_tint_and_emphasis() {
+        let (doc, theme) = diff_doc(D_OLD, D_NEW, &DiffDiffer);
+        let row = &doc.rows[1];
+        assert_eq!(row.cell(Side::Left).bg, Some(theme.left_bg));
+        assert_eq!(row.cell(Side::Right).bg, Some(theme.right_bg));
+
+        let emphasised = |side: Side, emph: Color| -> String {
+            row.cell(side)
+                .spans
+                .iter()
+                .filter(|s| s.bg == Some(emph))
+                .map(|s| s.text.as_str())
+                .collect()
+        };
+        assert_eq!(emphasised(Side::Left, theme.left_emph_bg), "1");
+        assert_eq!(emphasised(Side::Right, theme.right_emph_bg), "10");
+    }
+
+    #[test]
+    fn unchanged_rows_of_a_diff_keep_the_page_background() {
+        let (doc, _) = diff_doc(D_OLD, D_NEW, &DiffDiffer);
+        assert!(doc.rows[0].cells.iter().all(|c| c.bg.is_none()));
+        assert!(!doc.rows[0].changed);
+    }
+
+    #[test]
+    fn consecutive_changes_form_one_hunk() {
+        let (doc, _) = diff_doc(D_OLD, D_NEW, &DiffDiffer);
+        // rows 1..=3 all differ; row 0 and the closing brace do not
+        assert_eq!(doc.hunks, vec![1]);
+        assert!(doc.rows[1..4].iter().all(|r| r.changed));
+        assert!(!doc.rows[4].changed);
+    }
+
+    #[test]
+    fn identical_files_show_no_changes_at_all() {
+        let (doc, _) = diff_doc(D_OLD, D_OLD, &no_conflicts_differ());
+        assert!(doc.rows.iter().all(|r| !r.changed));
+        assert!(doc.hunks.is_empty());
+        assert!(doc.rows.iter().flat_map(|r| &r.cells).all(|c| c.bg.is_none()));
+        assert_eq!(doc.len(), 5, "the trailing empty row is dropped");
+    }
+
+    #[test]
+    fn an_added_file_is_a_gap_all_down_the_old_side() {
+        struct AllNew;
+        impl Differ for AllNew {
+            fn diff(&self, _old: &str, new: &str) -> crate::external::difft::DiffResult {
+                use crate::external::difft::{DiffResult, line_count};
+                DiffResult {
+                    aligned: (0..line_count(new) as u32).map(|i| (None, Some(i))).collect(),
+                    ..DiffResult::default()
+                }
+            }
+        }
+        let (doc, theme) = diff_doc("", D_NEW, &AllNew);
+        assert!(!doc.is_empty());
+        assert!(doc.rows.iter().all(|r| r.cell(Side::Left).is_gap()));
+        assert_eq!(doc.rows[0].cell(Side::Left).bg, Some(theme.gap_bg));
+        assert!(doc.rows.iter().all(|r| r.changed));
+    }
+
+    #[test]
+    fn a_diff_never_fills_the_base_slot() {
+        let (doc, _) = diff_doc(D_OLD, D_NEW, &DiffDiffer);
+        for row in &doc.rows {
+            let base = &row.cells[Side::Base.index()];
+            assert!(base.spans.is_empty() && base.bg.is_none() && base.line_no.is_none());
+        }
+    }
+
+    /// A differ that reports a plain line-for-line alignment and no changes.
+    fn no_conflicts_differ() -> StaticDiffer {
+        StaticDiffer::default()
     }
 
     #[test]

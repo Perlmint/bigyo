@@ -155,12 +155,29 @@ impl<'a> App<'a> {
         Ok(())
     }
 
-    /// The session of the file currently open.
-    fn session(&self) -> &MergeSession {
-        self.workspace
-            .current()
-            .and_then(|f| f.session.as_ref())
-            .expect("the open file always has a session")
+    /// The session of the file currently open, if it is a merge.
+    fn session(&self) -> Option<&MergeSession> {
+        self.workspace.current().and_then(|f| f.session.as_ref())
+    }
+
+    /// True when the open file is a diff, which has no merged panel and
+    /// nothing to resolve.
+    fn is_diff(&self) -> bool {
+        self.workspace.current().is_some_and(|f| f.is_diff())
+    }
+
+    /// How many conflict regions the open file has; zero for a diff.
+    fn conflict_count(&self) -> usize {
+        self.session().map_or(0, MergeSession::conflict_count)
+    }
+
+    fn resolved_count(&self) -> usize {
+        self.session().map_or(0, MergeSession::resolved_count)
+    }
+
+    fn resolution(&self) -> Resolution {
+        self.session()
+            .map_or(Resolution::Unresolved, |s| s.resolution(self.selected))
     }
 
     /// Load the file the workspace is pointing at, replacing the view.
@@ -242,7 +259,9 @@ impl<'a> App<'a> {
             KeyCode::Char(']') => self.change_file(true),
             KeyCode::Char('[') => self.change_file(false),
 
-            KeyCode::Tab | KeyCode::BackTab => self.focus = self.focus.toggled(),
+            KeyCode::Tab | KeyCode::BackTab if !self.is_diff() => {
+                self.focus = self.focus.toggled()
+            }
 
             KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
@@ -311,8 +330,22 @@ impl<'a> App<'a> {
     }
 
     /// Move the region cursor and bring that region into view in *both* panels.
+    ///
+    /// A diff has hunks rather than conflict regions, so the same keys step
+    /// through those instead.
     fn select_region(&mut self, index: usize) {
-        let total = self.session().conflict_count();
+        if self.is_diff() {
+            let hunks = self.view.panes.hunks.clone();
+            if hunks.is_empty() {
+                self.status = Some("no changes".into());
+                return;
+            }
+            self.selected = index.min(hunks.len() - 1);
+            self.set_scroll(Focus::Panes, hunks[self.selected]);
+            return;
+        }
+
+        let total = self.conflict_count();
         if total == 0 {
             self.status = Some("no conflicts".into());
             return;
@@ -330,17 +363,18 @@ impl<'a> App<'a> {
     }
 
     fn resolve(&mut self, resolution: Resolution) {
-        if self.session().conflict_count() == 0 {
+        if self.conflict_count() == 0 {
             self.status = Some("no conflicts to resolve".into());
             return;
         }
         let selected = self.selected;
         let file = self.workspace.current_mut().expect("a file is open");
         file.saved = false;
-        file.session
-            .as_mut()
-            .expect("the open file has a session")
-            .set_resolution(selected, resolution);
+        let Some(session) = file.session.as_mut() else {
+            self.status = Some("a diff has nothing to resolve".into());
+            return;
+        };
+        session.set_resolution(selected, resolution);
 
         // `view` and `workspace` are separate fields, so the session can be
         // borrowed to re-render without conflicting with the mutation above.
@@ -351,8 +385,12 @@ impl<'a> App<'a> {
     }
 
     fn write_output(&mut self) {
-        let unresolved = self.session().conflict_count() - self.session().resolved_count();
-        let content = self.session().to_output();
+        let Some(session) = self.session() else {
+            self.status = Some("a diff has nothing to write".into());
+            return;
+        };
+        let unresolved = session.conflict_count() - session.resolved_count();
+        let content = session.to_output();
 
         let (path, stage) = match &self.destination {
             Destination::Path(None) => {
@@ -398,6 +436,24 @@ impl<'a> App<'a> {
             let [body, status] =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
             self.draw_files(frame, body);
+            self.draw_status(frame, status);
+            return;
+        }
+
+        // A diff has only the two panes, so it gets the whole body and none of
+        // the merge screen's split, merged panel or focus handling.
+        if self.is_diff() {
+            let [body, status] =
+                Layout::vertical([Constraint::Min(2), Constraint::Length(1)]).areas(frame.area());
+            let [pane_titles, panes] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(body);
+
+            self.focus = Focus::Panes;
+            self.viewport = [panes.height as usize, 0];
+            self.set_scroll(Focus::Panes, self.scroll[0]);
+
+            self.draw_pane_titles(frame, pane_titles);
+            self.draw_panes(frame, panes);
             self.draw_status(frame, status);
             return;
         }
@@ -503,26 +559,28 @@ impl<'a> App<'a> {
 
     fn state_color(&self, state: FileState) -> Color {
         match state {
-            FileState::Conflict => self.theme.marker_fg,
-            FileState::Resolved => self.theme.resolved_fg,
+            FileState::Conflict | FileState::Modified => self.theme.marker_fg,
+            FileState::Resolved | FileState::Added => self.theme.resolved_fg,
+            FileState::Deleted => self.theme.conflict_selected_bg,
             FileState::Binary => self.theme.dimmed_fg,
         }
     }
 
-    /// Names the file behind each of the three revision columns.
+    /// Names the file behind each revision column.
     fn draw_pane_titles(&self, frame: &mut Frame, area: Rect) {
-        let columns = pane_columns(area);
+        let sides = self.view.panes.columns.clone();
+        let columns = pane_columns(area, sides.len());
         let focused = self.focus == Focus::Panes;
 
-        for side in Side::ALL {
-            let column = columns[side.index()];
-            let is_last = side.index() == 2;
+        for (position, side) in sides.iter().copied().enumerate() {
+            let column = columns[position];
+            let is_last = position + 1 == sides.len();
             let width = (column.width as usize).saturating_sub(usize::from(!is_last));
 
             // The focus marker goes on the last column, matching the merged bar.
             let marker = if focused && is_last { "◂ " } else { "" };
             let label = section_label(
-                DiffTheme::side_label(side),
+                side.label(self.is_diff()),
                 self.view.names.side(side),
                 width.saturating_sub(display_width(marker)),
             );
@@ -692,12 +750,13 @@ impl<'a> App<'a> {
         let scroll = self.scroll[Focus::Panes.index()];
         let hscroll = self.hscroll[Focus::Panes.index()];
         let selected = self.view.panes.conflicts.get(self.selected).cloned();
-        let columns = pane_columns(area);
+        let sides = self.view.panes.columns.clone();
+        let columns = pane_columns(area, sides.len());
 
-        for side in Side::ALL {
-            let column = columns[side.index()];
+        for (position, side) in sides.iter().copied().enumerate() {
+            let column = columns[position];
             // Every column but the last gives up its rightmost cell to a divider.
-            let is_last = side.index() == 2;
+            let is_last = position + 1 == sides.len();
             let content_width = (column.width as usize).saturating_sub(usize::from(!is_last));
             let gutter = (self.view.pane_digits + 2).min(content_width);
             let text_width = content_width.saturating_sub(gutter);
@@ -718,7 +777,7 @@ impl<'a> App<'a> {
                         Some(_)
                             if in_selection
                                 && !cell.is_gap()
-                                && !self.session().resolution(self.selected).is_resolved() =>
+                                && !self.resolution().is_resolved() =>
                         {
                             Some(self.theme.conflict_selected_bg)
                         }
@@ -768,7 +827,7 @@ impl<'a> App<'a> {
     }
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
-        let total = self.session().conflict_count();
+        let total = self.conflict_count();
         // Only worth naming the file's place when there is more than one.
         let file = if self.workspace.len() > 1 {
             format!(
@@ -787,18 +846,30 @@ impl<'a> App<'a> {
                 self.workspace.len(),
                 self.workspace.resolved_count()
             ),
+            None if self.is_diff() => {
+                let hunks = self.view.panes.hunks.len();
+                if hunks == 0 {
+                    format!(" {file}  no changes ")
+                } else {
+                    format!(" {file}  hunk {}/{hunks} ", self.selected + 1)
+                }
+            }
             None if total == 0 => format!(" {file}  no conflicts "),
             None => format!(
                 " {file}  resolved {}/{}  ·  conflict {}/{}: {} ",
-                self.session().resolved_count(),
+                self.resolved_count(),
                 total,
                 self.selected + 1,
                 total,
-                self.session().resolution(self.selected).label(),
+                self.resolution().label(),
             ),
         };
         let right = match self.screen {
             Screen::Files => " j/k enter esc q ".to_string(),
+            Screen::Merge if self.is_diff() && self.workspace.len() > 1 => {
+                " f ]/[ n/p j/k q ".to_string()
+            }
+            Screen::Merge if self.is_diff() => " n/p j/k h/l q ".to_string(),
             Screen::Merge if self.workspace.len() > 1 => {
                 " f ]/[ tab 1/2/3 b u n/p w q ".to_string()
             }
@@ -831,6 +902,19 @@ fn open_current<'a>(
     let file = workspace
         .current_mut()
         .context("the workspace has no file to open")?;
+
+    if file.is_diff() {
+        return FileView::new_diff(
+            assets,
+            file.left.clone(),
+            file.right.clone(),
+            &file.path,
+            file.names.clone(),
+            language,
+            theme_name,
+            theme,
+        );
+    }
 
     if file.session.is_none() {
         let merged =
@@ -866,13 +950,11 @@ fn recolor(spans: &[StyledSpan], bg: Option<Color>) -> Vec<StyledSpan> {
 
 /// The three equal columns the panes and their title bar share, so labels sit
 /// over the columns they name.
-fn pane_columns(area: Rect) -> [Rect; 3] {
-    Layout::horizontal([
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-    ])
-    .areas(area)
+fn pane_columns(area: Rect, count: usize) -> Vec<Rect> {
+    let n = count.max(1) as u32;
+    Layout::horizontal(vec![Constraint::Ratio(1, n); count.max(1)])
+        .split(area)
+        .to_vec()
 }
 
 fn styled(content: String, fg: Option<Color>, bg: Option<Color>) -> Span<'static> {
@@ -1005,7 +1087,7 @@ mod tests {
     }
     use crate::merge::diff3::MergedChunk;
     use crate::merge::session::MarkerLabels;
-    use crate::merge::workspace::ConflictFile;
+    use crate::merge::workspace::{EntryKind, FileEntry};
     use crate::render::highlight::DEFAULT_THEME;
     use crate::render::panes::SectionNames;
     use std::path::PathBuf;
@@ -1065,23 +1147,24 @@ mod tests {
         )
     }
 
-    fn file(path: &str, conflicts: usize) -> ConflictFile {
+    fn file(path: &str, conflicts: usize) -> FileEntry {
         let (base, left, right, session) = revisions(conflicts);
-        ConflictFile {
+        FileEntry {
             path: PathBuf::from(path),
             abs: PathBuf::from("/repo").join(path),
             base,
             left,
             right,
             names: SectionNames::new("left.rs", "base.rs", "right.rs", path),
+            kind: EntryKind::Merge,
             session: Some(session),
             binary: false,
             saved: false,
         }
     }
 
-    fn binary(path: &str) -> ConflictFile {
-        ConflictFile {
+    fn binary(path: &str) -> FileEntry {
+        FileEntry {
             binary: true,
             session: None,
             ..file(path, 0)
@@ -1101,11 +1184,11 @@ mod tests {
             }
         }
 
-        fn app(&self, files: Vec<ConflictFile>) -> App<'_> {
+        fn app(&self, files: Vec<FileEntry>) -> App<'_> {
             self.app_to(files, Destination::Path(None))
         }
 
-        fn app_to(&self, files: Vec<ConflictFile>, destination: Destination) -> App<'_> {
+        fn app_to(&self, files: Vec<FileEntry>, destination: Destination) -> App<'_> {
             App::new(
                 &self.assets,
                 Workspace::new(files),
@@ -1201,15 +1284,15 @@ mod tests {
         render_to_string(&mut app, 96, 16);
 
         app.on_key(key('1'));
-        assert_eq!(app.session().resolution(0), Resolution::Left);
+        assert_eq!(app.session().unwrap().resolution(0), Resolution::Left);
         let out = render_to_string(&mut app, 96, 16);
         assert!(out.contains("CONFLICT 1/1 · left"), "{out}");
         assert!(out.contains("resolved 1/1"), "{out}");
 
         app.on_key(key('3'));
-        assert_eq!(app.session().resolution(0), Resolution::Right);
+        assert_eq!(app.session().unwrap().resolution(0), Resolution::Right);
         app.on_key(key('u'));
-        assert_eq!(app.session().resolution(0), Resolution::Unresolved);
+        assert_eq!(app.session().unwrap().resolution(0), Resolution::Unresolved);
     }
 
     #[test]
@@ -1219,7 +1302,7 @@ mod tests {
         render_to_string(&mut app, 96, 16);
 
         let region = app.view.panes.conflicts[0].clone();
-        let bgs = |app: &App<'_>| Side::ALL.map(|s| app.view.panes.rows[region.start].cell(s).bg);
+        let bgs = |app: &App<'_>| Side::MERGE.map(|s| app.view.panes.rows[region.start].cell(s).bg);
         assert_eq!(bgs(&app), [Some(h.theme.conflict_bg); 3]);
 
         app.on_key(key('1'));
@@ -1256,7 +1339,7 @@ mod tests {
         let mut app = h.app(vec![file("a.rs", 3)]);
         render_to_string(&mut app, 96, 14);
 
-        assert_eq!(app.session().conflict_count(), 3);
+        assert_eq!(app.session().unwrap().conflict_count(), 3);
         app.on_key(key('n'));
         assert_eq!(app.selected, 1);
         app.on_key(key('n'));
@@ -1355,7 +1438,7 @@ mod tests {
         assert_eq!(app.screen, Screen::Merge);
         assert_eq!(app.workspace.current_index(), 1);
         assert_eq!(app.title, "b.rs");
-        assert_eq!(app.session().conflict_count(), 2, "b.rs's own session");
+        assert_eq!(app.session().unwrap().conflict_count(), 2, "b.rs's own session");
     }
 
     #[test]
@@ -1408,18 +1491,18 @@ mod tests {
         app.on_key(key('1'));
         app.on_key(key('n'));
         app.on_key(key('3'));
-        assert_eq!(app.session().resolution(0), Resolution::Left);
-        assert_eq!(app.session().resolution(1), Resolution::Right);
+        assert_eq!(app.session().unwrap().resolution(0), Resolution::Left);
+        assert_eq!(app.session().unwrap().resolution(1), Resolution::Right);
 
         app.on_key(key(']'));
         assert_eq!(app.title, "b.rs");
         assert_eq!(app.selected, 0, "the region cursor resets for the new file");
-        assert_eq!(app.session().resolution(0), Resolution::Unresolved);
+        assert_eq!(app.session().unwrap().resolution(0), Resolution::Unresolved);
 
         app.on_key(key('['));
         assert_eq!(app.title, "a.rs");
-        assert_eq!(app.session().resolution(0), Resolution::Left);
-        assert_eq!(app.session().resolution(1), Resolution::Right);
+        assert_eq!(app.session().unwrap().resolution(0), Resolution::Left);
+        assert_eq!(app.session().unwrap().resolution(1), Resolution::Right);
     }
 
     #[test]
@@ -1429,6 +1512,155 @@ mod tests {
         assert!(render_to_string(&mut app, 96, 16).contains("a.rs [1/3]"));
         app.on_key(key(']'));
         assert!(render_to_string(&mut app, 96, 16).contains("b.rs [2/3]"));
+    }
+
+    // ---- diff mode --------------------------------------------------------
+
+    const D_OLD: &str = "fn main() {\n    let a = 1;\n    let b = 2;\n}\n";
+    const D_NEW: &str = "fn main() {\n    let a = 100;\n}\n";
+
+    fn diff_file(path: &str, old: &str, new: &str) -> FileEntry {
+        FileEntry {
+            path: PathBuf::from(path),
+            abs: PathBuf::from("/repo").join(path),
+            base: String::new(),
+            left: old.into(),
+            right: new.into(),
+            names: SectionNames {
+                left: "old".into(),
+                base: String::new(),
+                right: "new".into(),
+                merged: path.into(),
+            },
+            kind: EntryKind::Diff,
+            session: None,
+            binary: false,
+            saved: false,
+        }
+    }
+
+    #[test]
+    fn a_diff_draws_two_panes_and_no_merged_panel() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        let out = render_to_string(&mut app, 96, 14);
+
+        assert!(!out.contains("MERGED"), "a diff has nothing to merge:\n{out}");
+        assert!(!out.contains("CONFLICT"), "{out}");
+        let rows: Vec<&str> = out.lines().collect();
+        assert!(rows[0].contains("OLD · old"), "{:?}", rows[0]);
+        assert!(rows[0].contains("NEW · new"), "{:?}", rows[0]);
+        assert_eq!(rows[0].matches('┬').count(), 1, "two columns: {:?}", rows[0]);
+        assert_eq!(rows[1].matches('│').count(), 1, "{:?}", rows[1]);
+    }
+
+    #[test]
+    fn the_resolution_keys_do_nothing_to_a_diff() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        render_to_string(&mut app, 96, 14);
+
+        for k in ['1', '2', '3', 'b', 'u'] {
+            app.on_key(key(k));
+            assert!(app.session().is_none(), "{k} must not invent a session");
+        }
+        app.on_key(key('w'));
+        assert_eq!(app.status.as_deref(), Some("a diff has nothing to write"));
+    }
+
+    #[test]
+    fn tab_is_inert_in_a_diff() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        render_to_string(&mut app, 96, 14);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Panes, "there is only one panel to focus");
+    }
+
+    #[test]
+    fn n_and_p_walk_the_hunks_of_a_diff() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        render_to_string(&mut app, 96, 8);
+
+        let hunks = app.view.panes.hunks.clone();
+        assert!(!hunks.is_empty(), "the fixture must differ");
+        app.on_key(key('n'));
+        assert_eq!(app.selected, (hunks.len() - 1).min(1));
+        app.on_key(key('p'));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll[Focus::Panes.index()], hunks[0]);
+    }
+
+    #[test]
+    fn the_status_bar_counts_hunks_rather_than_conflicts() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        let out = render_to_string(&mut app, 96, 14);
+        assert!(out.contains("hunk 1/"), "{out}");
+        assert!(!out.contains("resolved"), "{out}");
+    }
+
+    #[test]
+    fn an_unchanged_diff_says_so() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_OLD)]);
+        let out = render_to_string(&mut app, 96, 14);
+        assert!(out.contains("no changes"), "{out}");
+    }
+
+    #[test]
+    fn the_picker_lists_diff_entries_by_what_happened_to_them() {
+        let h = Harness::new();
+        let mut app = h.app(vec![
+            diff_file("a.rs", D_OLD, D_NEW),
+            diff_file("added.rs", "", D_NEW),
+            diff_file("gone.rs", D_OLD, ""),
+        ]);
+        app.on_key(key('f'));
+        let out = render_to_string(&mut app, 60, 10);
+
+        assert!(out.contains("modified"), "{out}");
+        assert!(out.contains("added"), "{out}");
+        assert!(out.contains("deleted"), "{out}");
+        assert!(!out.contains("conflict"), "a diff has no conflicts:\n{out}");
+    }
+
+    #[test]
+    fn stepping_between_diff_files_reloads_the_view() {
+        let h = Harness::new();
+        let mut app = h.app(vec![
+            diff_file("a.rs", D_OLD, D_NEW),
+            diff_file("b.rs", D_OLD, D_OLD),
+        ]);
+        render_to_string(&mut app, 96, 14);
+
+        app.on_key(key(']'));
+        assert_eq!(app.title, "b.rs");
+        assert!(app.view.panes.hunks.is_empty(), "b.rs is unchanged");
+        app.on_key(key('['));
+        assert_eq!(app.title, "a.rs");
+        assert!(!app.view.panes.hunks.is_empty());
+    }
+
+    #[test]
+    fn a_diff_renders_at_degenerate_terminal_sizes() {
+        let h = Harness::new();
+        let mut app = h.app(vec![diff_file("a.rs", D_OLD, D_NEW)]);
+        for (w, hh) in [(6, 3), (1, 2), (3, 4), (40, 2), (96, 2)] {
+            render_to_string(&mut app, w, hh);
+        }
+    }
+
+    #[test]
+    fn merge_and_diff_entries_can_share_a_workspace() {
+        // Nothing stops a workspace holding both, and switching between them
+        // must swap the whole screen shape.
+        let h = Harness::new();
+        let mut app = h.app(vec![file("m.rs", 1), diff_file("d.rs", D_OLD, D_NEW)]);
+        assert!(render_to_string(&mut app, 96, 16).contains("MERGED"));
+        app.on_key(key(']'));
+        assert!(!render_to_string(&mut app, 96, 16).contains("MERGED"));
     }
 
     // ---- saving -----------------------------------------------------------

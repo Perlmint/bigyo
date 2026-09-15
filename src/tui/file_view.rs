@@ -18,7 +18,7 @@ use crate::external::difft::{CachingDiffer, DifftCli};
 use crate::merge::session::MergeSession;
 use crate::render::document::{Document, build_document};
 use crate::render::highlight::{Assets, Highlighter};
-use crate::render::panes::{PaneDocument, SectionNames, build_panes};
+use crate::render::panes::{PaneDocument, SectionNames, build_diff_panes, build_panes};
 use crate::render::theme::DiffTheme;
 
 pub struct FileView<'a> {
@@ -82,6 +82,77 @@ impl<'a> FileView<'a> {
         Ok(view)
     }
 
+    /// Build the view for a two-way diff: two panes and no merged document.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_diff(
+        assets: &'a Assets,
+        old: String,
+        new: String,
+        display_path: &Path,
+        names: SectionNames,
+        language: Option<&str>,
+        theme_name: &str,
+        theme: &DiffTheme,
+    ) -> Result<Self> {
+        let mut view = Self::empty(assets, old, new, display_path, names, language, theme_name)?;
+        view.panes = build_diff_panes(
+            &view.base,
+            &view.left,
+            &view.highlighter,
+            &view.differ,
+            theme,
+        );
+        view.measure();
+        Ok(view)
+    }
+
+    /// The parts that do not depend on how many revisions there are.
+    ///
+    /// A diff keeps its pre-image in `base` and post-image in `left`; nothing
+    /// reads those fields except the builders above.
+    fn empty(
+        assets: &'a Assets,
+        base: String,
+        left: String,
+        display_path: &Path,
+        names: SectionNames,
+        language: Option<&str>,
+        theme_name: &str,
+    ) -> Result<Self> {
+        let highlighter = assets.highlighter(language, Some(display_path), theme_name)?;
+        let extension = display_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_owned);
+        let differ = CachingDiffer::new(DifftCli::new(language.map(str::to_owned), extension));
+        Ok(Self {
+            page_bg: highlighter.background,
+            syntax: highlighter.syntax_name().to_owned(),
+            highlighter,
+            differ,
+            base,
+            left,
+            right: String::new(),
+            names,
+            doc: Document::default(),
+            panes: PaneDocument::default(),
+            gutter_digits: 3,
+            pane_digits: 2,
+        })
+    }
+
+    fn measure(&mut self) {
+        self.gutter_digits = widest(self.doc.rows.iter().filter_map(|r| r.line_no)).max(3);
+        self.pane_digits = widest(
+            self.panes
+                .rows
+                .iter()
+                .flat_map(|r| &r.cells)
+                .filter_map(|c| c.line_no),
+        )
+        .max(2);
+    }
+
     /// Re-render both documents from the session's current resolutions.
     pub fn rebuild(&mut self, session: &MergeSession, theme: &DiffTheme) {
         self.doc = build_document(session, &self.highlighter, &self.differ, theme);
@@ -94,15 +165,7 @@ impl<'a> FileView<'a> {
             &self.differ,
             theme,
         );
-        self.gutter_digits = widest(self.doc.rows.iter().filter_map(|r| r.line_no)).max(3);
-        self.pane_digits = widest(
-            self.panes
-                .rows
-                .iter()
-                .flat_map(|r| &r.cells)
-                .filter_map(|c| c.line_no),
-        )
-        .max(2);
+        self.measure();
     }
 }
 

@@ -599,7 +599,7 @@ fn two_regions_can_display_different_choices_at_the_same_time() {
 
     let check = |region: usize, chosen: Side| {
         for row in &doc.rows[doc.conflicts[region].clone()] {
-            for side in Side::ALL {
+            for side in Side::MERGE {
                 let cell = row.cell(side);
                 if cell.is_gap() {
                     continue;
@@ -629,7 +629,7 @@ fn two_regions_can_display_different_choices_at_the_same_time() {
 
     // and the region left undecided still offers all three
     for row in &doc.rows[doc.conflicts[2].clone()] {
-        for side in Side::ALL {
+        for side in Side::MERGE {
             let cell = row.cell(side);
             if !cell.is_gap() {
                 assert_eq!(cell.bg, Some(theme.conflict_bg), "region 2: {side:?}");
@@ -842,5 +842,127 @@ mod repo_mode {
         // a bare temp dir is not a repo — unless one encloses it, which the
         // system temp directory never is
         assert!(Repo::discover(dir.path()).unwrap().is_none());
+    }
+}
+
+// ---- diff mode -----------------------------------------------------------
+
+mod diff_mode {
+    use std::path::Path;
+    use std::process::Command;
+
+    use bigyo::external::git::Repo;
+    use bigyo::merge::workspace::{FileState, Workspace};
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repo with one commit, then a modification, an addition and a deletion
+    /// left in the working tree — the three statuses `--name-status` reports.
+    fn changed_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+
+        git(p, &["init", "-q", "--initial-branch=main", "."]);
+        git(p, &["config", "user.email", "t@example.com"]);
+        git(p, &["config", "user.name", "T"]);
+
+        std::fs::create_dir_all(p.join("src")).unwrap();
+        std::fs::write(p.join("src/a.rs"), "fn a() -> i32 {\n    1\n}\n").unwrap();
+        std::fs::write(p.join("gone.rs"), "fn gone() {}\n").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-qm", "base"]);
+
+        std::fs::write(p.join("src/a.rs"), "fn a() -> i32 {\n    2\n}\n").unwrap();
+        std::fs::write(p.join("added.rs"), "fn added() {}\n").unwrap();
+        std::fs::remove_file(p.join("gone.rs")).unwrap();
+        dir
+    }
+
+    #[test]
+    #[ignore = "requires the `git` binary"]
+    fn changed_reports_every_status_against_the_working_tree() {
+        let dir = changed_repo();
+        let repo = Repo::discover(dir.path()).unwrap().expect("a repo");
+
+        let mut entries = repo.changed("HEAD", None).unwrap();
+        entries.sort_by_key(|e| e.path.clone());
+        let summary: Vec<(String, char)> = entries
+            .iter()
+            .map(|e| (e.path.display().to_string(), e.status))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("added.rs".to_string(), 'A'),
+                ("gone.rs".to_string(), 'D'),
+                ("src/a.rs".to_string(), 'M'),
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the `git` binary"]
+    fn show_reads_the_pre_image_and_reports_paths_a_revision_lacks() {
+        let dir = changed_repo();
+        let repo = Repo::discover(dir.path()).unwrap().expect("a repo");
+
+        let committed = repo.show("HEAD", Path::new("src/a.rs")).unwrap().unwrap();
+        assert_eq!(String::from_utf8(committed).unwrap(), "fn a() -> i32 {\n    1\n}\n");
+
+        // an added file has no pre-image, which is not an error
+        assert!(repo.show("HEAD", Path::new("added.rs")).unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires the `git` binary"]
+    fn a_workspace_built_from_a_diff_pairs_each_side() {
+        let dir = changed_repo();
+        let repo = Repo::discover(dir.path()).unwrap().expect("a repo");
+        let workspace = Workspace::from_diff(&repo, "HEAD", None).unwrap();
+
+        let file = |name: &str| {
+            workspace
+                .files()
+                .iter()
+                .find(|f| f.path.to_str() == Some(name))
+                .unwrap_or_else(|| panic!("{name} missing from {:?}", workspace.files().len()))
+        };
+
+        let modified = file("src/a.rs");
+        assert_eq!(modified.state(), FileState::Modified);
+        assert!(modified.left.contains("    1"), "pre-image from the commit");
+        assert!(modified.right.contains("    2"), "post-image from the tree");
+        assert!(modified.is_diff() && modified.session.is_none());
+
+        let added = file("added.rs");
+        assert_eq!(added.state(), FileState::Added);
+        assert!(added.left.is_empty());
+        assert!(added.right.contains("fn added"));
+
+        let deleted = file("gone.rs");
+        assert_eq!(deleted.state(), FileState::Deleted);
+        assert!(deleted.left.contains("fn gone"));
+        assert!(deleted.right.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the `git` binary"]
+    fn a_pathspec_narrows_a_diff_workspace() {
+        let dir = changed_repo();
+        let repo = Repo::discover(dir.path()).unwrap().expect("a repo");
+        let workspace = Workspace::from_diff(&repo, "HEAD", Some(Path::new("src"))).unwrap();
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(workspace.files()[0].path.display().to_string(), "src/a.rs");
     }
 }

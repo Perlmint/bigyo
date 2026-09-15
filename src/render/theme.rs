@@ -79,8 +79,24 @@ impl Side {
         }
     }
 
-    /// The three sides in column order.
-    pub const ALL: [Self; 3] = [Self::Left, Self::Base, Self::Right];
+    /// The three columns of a merge, in order.
+    pub const MERGE: [Self; 3] = [Self::Left, Self::Base, Self::Right];
+
+    /// The two columns of a diff: the pre-image on the left, post-image on the
+    /// right, so the merge tints carry straight over.
+    pub const DIFF: [Self; 2] = [Self::Left, Self::Right];
+
+    /// What a column is called in each mode.
+    pub fn label(self, diff: bool) -> &'static str {
+        match (self, diff) {
+            (Self::Left, false) => "LEFT",
+            (Self::Base, false) => "BASE",
+            (Self::Right, false) => "RIGHT",
+            (Self::Left, true) => "OLD",
+            (Self::Right, true) => "NEW",
+            (Self::Base, true) => "BASE",
+        }
+    }
 }
 
 impl DiffTheme {

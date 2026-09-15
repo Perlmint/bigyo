@@ -92,6 +92,42 @@ impl Repo {
         Ok(out.stdout)
     }
 
+    /// What `git diff <rev>` reports against the working tree.
+    pub fn changed(&self, rev: &str, pathspec: Option<&Path>) -> Result<Vec<ChangedEntry>> {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.root)
+            .args(["diff", "--name-status", "-z", rev]);
+        if let Some(spec) = pathspec {
+            cmd.arg("--").arg(spec);
+        }
+        let out = cmd.output().context("running `git diff --name-status`")?;
+        if !out.status.success() {
+            bail!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        parse_name_status(&out.stdout)
+    }
+
+    /// `git show <rev>:<path>`, or `Ok(None)` when that revision has no such
+    /// path — which is how an added file's pre-image reads.
+    ///
+    /// The path goes straight into argv, so there is nothing to quote.
+    pub fn show(&self, rev: &str, path: &Path) -> Result<Option<Vec<u8>>> {
+        let mut spec = std::ffi::OsString::from(rev);
+        spec.push(":");
+        spec.push(path.as_os_str());
+
+        let out = Command::new("git")
+            .current_dir(&self.root)
+            .arg("show")
+            .arg(&spec)
+            .output()
+            .context("running `git show`")?;
+        Ok(out.status.success().then_some(out.stdout))
+    }
+
     /// Stage `path`, which is what marks a conflict resolved for git.
     pub fn add(&self, path: &Path) -> Result<()> {
         let out = Command::new("git")
@@ -110,6 +146,66 @@ impl Repo {
         }
         Ok(())
     }
+}
+
+/// One path `git diff` reports as changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedEntry {
+    /// The post-image path — the destination for a rename.
+    pub path: PathBuf,
+    /// The pre-image path, when a rename or copy moved it.
+    pub old_path: Option<PathBuf>,
+    /// `A`, `M`, `D`, `R`, `C`, `T` …
+    pub status: char,
+}
+
+/// Parse `git diff --name-status -z` output.
+///
+/// Records are `<status>\0<path>\0`, except renames and copies, which are
+/// `<status>\0<src>\0<dst>\0` — so the parser has to consume a second field
+/// for those rather than assuming one path each.
+pub fn parse_name_status(bytes: &[u8]) -> Result<Vec<ChangedEntry>> {
+    let mut fields = bytes
+        .split(|&b| b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            std::str::from_utf8(f).context("git reported a field that is not valid UTF-8")
+        });
+
+    let mut out = Vec::new();
+    while let Some(status) = fields.next().transpose()? {
+        let letter = status
+            .chars()
+            .next()
+            .with_context(|| format!("empty status field in {status:?}"))?;
+        if !letter.is_ascii_alphabetic() {
+            bail!("unreadable status {status:?}");
+        }
+
+        let first = fields
+            .next()
+            .transpose()?
+            .with_context(|| format!("status {status:?} with no path"))?;
+
+        // A rename or copy names where it came from as well as where it went.
+        let (old_path, path) = if matches!(letter, 'R' | 'C') {
+            let second = fields
+                .next()
+                .transpose()?
+                .with_context(|| format!("status {status:?} with only one path"))?;
+            (Some(PathBuf::from(first)), PathBuf::from(second))
+        } else {
+            (None, PathBuf::from(first))
+        };
+
+        out.push(ChangedEntry {
+            path,
+            old_path,
+            status: letter,
+        });
+    }
+
+    Ok(out)
 }
 
 /// Parse `git ls-files -u -z` output, grouping the stages of each path.
@@ -305,6 +401,97 @@ mod tests {
                 assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "{sha:?}");
             }
         }
+    }
+
+    // ---- git diff --name-status -z ---------------------------------------
+
+    /// Build `--name-status -z` output from `(status, paths)` records.
+    fn name_status(records: &[(&str, &[&str])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (status, paths) in records {
+            out.extend_from_slice(status.as_bytes());
+            out.push(0);
+            for path in *paths {
+                out.extend_from_slice(path.as_bytes());
+                out.push(0);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn one_path_per_ordinary_status() {
+        let entries = parse_name_status(&name_status(&[
+            ("M", &["src/a.rs"]),
+            ("A", &["new.rs"]),
+            ("D", &["gone.rs"]),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            entries.iter().map(|e| e.status).collect::<Vec<_>>(),
+            ['M', 'A', 'D']
+        );
+        assert_eq!(entries[0].path, PathBuf::from("src/a.rs"));
+        assert!(entries.iter().all(|e| e.old_path.is_none()));
+    }
+
+    #[test]
+    fn a_rename_consumes_two_paths() {
+        // The record that would desynchronise a parser assuming one path each.
+        let entries = parse_name_status(&name_status(&[
+            ("R100", &["old/name.rs", "new/name.rs"]),
+            ("M", &["after.rs"]),
+        ]))
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].status, 'R');
+        assert_eq!(entries[0].old_path, Some(PathBuf::from("old/name.rs")));
+        assert_eq!(entries[0].path, PathBuf::from("new/name.rs"));
+        // and the record after it is still read correctly
+        assert_eq!(entries[1].status, 'M');
+        assert_eq!(entries[1].path, PathBuf::from("after.rs"));
+    }
+
+    #[test]
+    fn a_copy_also_carries_its_source() {
+        let entries = parse_name_status(&name_status(&[("C75", &["from.rs", "to.rs"])])).unwrap();
+        assert_eq!(entries[0].status, 'C');
+        assert_eq!(entries[0].old_path, Some(PathBuf::from("from.rs")));
+        assert_eq!(entries[0].path, PathBuf::from("to.rs"));
+    }
+
+    #[test]
+    fn changed_paths_with_spaces_and_non_ascii_survive_verbatim() {
+        let entries = parse_name_status(&name_status(&[
+            ("M", &["dir with spaces/my file.rs"]),
+            ("A", &["테스트/파일.rs"]),
+        ]))
+        .unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+            [
+                PathBuf::from("dir with spaces/my file.rs"),
+                PathBuf::from("테스트/파일.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_name_status_output_yields_no_entries() {
+        assert!(parse_name_status(b"").unwrap().is_empty());
+        assert!(parse_name_status(b"\0\0").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_name_status_records_are_errors() {
+        // a status with no path at all
+        assert!(parse_name_status(b"M\0").is_err());
+        // a rename with only one path
+        assert!(parse_name_status(b"R100\0only.rs\0").is_err());
+        // a status that is not a letter
+        assert!(parse_name_status(b"7\0a.rs\0").is_err());
     }
 
     #[test]
